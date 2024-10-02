@@ -176,7 +176,8 @@ class Music(commands.Cog):
                 url = extracted_info['url']
                 info = extracted_info
             else:
-                await self.send_error_message(ctx.channel, f"Не удалось получить URL для трека: {info.get('title', 'Unknown')}")
+                await self.send_error_message(ctx.channel,
+                                              f"Не удалось получить URL для трека: {info.get('title', 'Unknown')}")
                 await self.play_next_track(ctx)
                 return
 
@@ -185,7 +186,11 @@ class Music(commands.Cog):
             await self.play_next_track(ctx)
             return
 
-        source = discord.FFmpegPCMAudio(url, before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
+        source = discord.FFmpegOpusAudio(
+            url,
+            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+            options="-vn"
+        )
         ctx.voice_client.play(source, after=lambda e: self.bot.loop.create_task(self.after_playing(ctx, e)))
 
         guild_id = ctx.guild.id

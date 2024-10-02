@@ -1,9 +1,7 @@
 services:
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: python_app
+    image: dullfox/very-smart-bot
+    container_name: discord_bot
     restart: always
     environment:
       - HTTP_PROXY=http://warp:1080

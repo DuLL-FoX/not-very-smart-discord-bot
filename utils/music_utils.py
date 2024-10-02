@@ -13,7 +13,7 @@ ytdl_format_options = {
         'preferredquality': '192',
     }],
     'outtmpl': 'downloads/%(id)s.%(ext)s',
-    'keepvideo': True
+    'keepvideo': False
 }
 ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
 
