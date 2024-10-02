@@ -6,89 +6,95 @@ from discord import Option
 from discord.ext import commands, tasks
 
 from utils.music_utils import ytdl, sp
-from utils.queue_manager import QueueManager
 
 
 class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.loop = bot.loop
-        self.last_played = None
-        self.ctx = None
-        self.queue_manager = QueueManager()
-        self.current_playing = None
+        self.guild_states = {}
         self.disconnect_timer.start()
-        self.first_time = True
+
+    def cog_unload(self):
+        self.disconnect_timer.cancel()
 
     @tasks.loop(minutes=5)
     async def disconnect_timer(self):
-        if self.ctx and self.ctx.voice_client and not self.ctx.voice_client.is_playing() and self.last_played and (
-                discord.utils.utcnow() - self.last_played).total_seconds() >= 300:
-            await self.leave_voice_channel()
+        for guild_id, state in list(self.guild_states.items()):
+            voice_client = state.get('voice_client')
+            last_played = state.get('last_played')
+            if voice_client and not voice_client.is_playing() and last_played and (
+                    discord.utils.utcnow() - last_played).total_seconds() >= 300:
+                await self.leave_voice_channel(voice_client, guild_id)
 
-    async def leave_voice_channel(self):
-        if self.ctx and self.ctx.voice_client:
-            embed = await self.create_embed("👋 Отключение",
-                                            "5 минут бездействия прошло. Я выхожу из голосового канала. Ня.пока!")
-            await self.ctx.respond(embed=embed)
-            await self.ctx.voice_client.disconnect()
-            self.last_played = None
+    async def leave_voice_channel(self, voice_client, guild_id):
+        if voice_client:
+            embed = self.create_embed("👋 Отключение",
+                                      "5 минут бездействия прошло. Я выхожу из голосового канала. Ня.пока!")
+            await voice_client.disconnect()
+            state = self.guild_states.get(guild_id)
+            if state:
+                channel = state.get('text_channel')
+                if channel:
+                    await channel.send(embed=embed)
+            del self.guild_states[guild_id]
 
-    async def create_embed(self, title, description, color=discord.Color.blue()):
+    def create_embed(self, title, description, color=discord.Color.blue()):
         embed = discord.Embed(title=title, description=description, color=color)
         embed.set_footer(text="🎵 Музыкальный бот | Наслаждайтесь музыкой!")
         return embed
 
     async def extract_info(self, url, download=False):
-        loop = asyncio.get_event_loop()
         try:
+            loop = asyncio.get_running_loop()
             return await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=download))
         except Exception as e:
-            await self.send_error_message(f"Ошибка при извлечении информации: {str(e)}")
             return None
 
-    async def send_error_message(self, content):
-        embed = await self.create_embed("❌ Ошибка", content, discord.Color.red())
-        await self.ctx.respond(embed=embed)
+    async def send_error_message(self, channel, content):
+        embed = self.create_embed("❌ Ошибка", content, discord.Color.red())
+        await channel.send(embed=embed)
 
-    async def add_to_queue(self, url):
+    async def add_to_queue(self, ctx, url):
+        guild_id = ctx.guild.id
+        state = self.guild_states.setdefault(guild_id, {'queue': [], 'last_played': None, 'voice_client': ctx.voice_client, 'text_channel': ctx.channel})
         if "open.spotify.com" in url:
-            added_tracks = await self.add_spotify_to_queue(url)
+            added_tracks = await self.add_spotify_to_queue(ctx, url)
             if added_tracks:
                 tracks_info = "\n".join([f"🎵 {track}" for track in added_tracks[:5]])
                 if len(added_tracks) > 5:
                     tracks_info += f"\n... и ещё {len(added_tracks) - 5} треков"
-                embed = await self.create_embed("🎶 Добавлено в очередь",
+                embed = self.create_embed("🎶 Добавлено в очередь",
                     f"**Добавлено {len(added_tracks)} треков из Spotify:**\n\n{tracks_info}")
                 embed.add_field(name="🔗 Источник", value="Spotify", inline=True)
-                embed.add_field(name="👤 Добавил", value=self.ctx.author.mention, inline=True)
-                await self.ctx.respond(embed=embed)
+                embed.add_field(name="👤 Добавил", value=ctx.author.mention, inline=True)
+                await ctx.respond(embed=embed)
             else:
-                await self.send_error_message("Не удалось добавить треки из Spotify в очередь")
+                await self.send_error_message(ctx.channel, "Не удалось добавить треки из Spotify в очередь")
         else:
             info = await self.extract_info(url, download=False)
             if info is None:
-                await self.send_error_message(f"Не удалось добавить трек в очередь: {url}")
+                await self.send_error_message(ctx.channel, f"Не удалось добавить трек в очередь: {url}")
                 return
 
             if 'entries' in info:
                 tracks_info = "\n".join([f"🎵 {entry['title']}" for entry in info['entries'][:5]])
                 if len(info['entries']) > 5:
                     tracks_info += f"\n... и ещё {len(info['entries']) - 5} треков"
-                embed = await self.create_embed("🎶 Добавлено в очередь",
+                embed = self.create_embed("🎶 Добавлено в очередь",
                     f"**Добавлено {len(info['entries'])} треков в очередь:**\n\n{tracks_info}")
                 embed.add_field(name="🔗 Источник", value="YouTube", inline=True)
-                embed.add_field(name="👤 Добавил", value=self.ctx.author.mention, inline=True)
-                await self.ctx.respond(embed=embed)
+                embed.add_field(name="👤 Добавил", value=ctx.author.mention, inline=True)
+                await ctx.respond(embed=embed)
                 for entry in info['entries']:
-                    self.queue_manager.add_to_queue(entry)
+                    state['queue'].append(entry)
             else:
-                self.queue_manager.add_to_queue(info)
-                embed = await self.create_embed("🎶 Добавлено в очередь", f"**Трек добавлен в очередь:**\n\n🎵 {info['title']}")
+                state['queue'].append(info)
+                embed = self.create_embed("🎶 Добавлено в очередь", f"**Трек добавлен в очередь:**\n\n🎵 {info['title']}")
                 embed.add_field(name="🔗 Источник", value="YouTube", inline=True)
-                embed.add_field(name="👤 Добавил", value=self.ctx.author.mention, inline=True)
+                embed.add_field(name="👤 Добавил", value=ctx.author.mention, inline=True)
                 embed.add_field(name="⏱️ Длительность", value=self.format_duration(info.get('duration', 0)), inline=True)
-                await self.ctx.respond(embed=embed)
+                await ctx.respond(embed=embed)
 
     def format_duration(self, duration):
         minutes, seconds = divmod(duration, 60)
@@ -98,29 +104,14 @@ class Music(commands.Cog):
         else:
             return f"{int(minutes):02d}:{int(seconds):02d}"
 
-    async def add_youtube_to_queue(self, url: str) -> Union[str, List[str]]:
-        info = await self.extract_info(url, download=False)
-        if info is None:
-            return f"Не удалось добавить трек в очередь: {url}"
-
-        if info.get("_type") == "playlist":
-            added_tracks = []
-            for entry in info["entries"]:
-                self.queue_manager.add_to_queue(entry)
-                added_tracks.append(entry['title'])
-            return added_tracks
-        else:
-            self.queue_manager.add_to_queue(info)
-            return info['title']
-
-    async def add_spotify_to_queue(self, url: str) -> Union[str, List[str]]:
+    async def add_spotify_to_queue(self, ctx, url: str) -> List[str]:
         added_tracks = []
         if "track" in url:
             track = sp.track(url)
             search_query = f"{track['name']} {track['artists'][0]['name']}"
             youtube_url = await self.search_youtube(search_query)
             if youtube_url:
-                result = await self.add_youtube_to_queue(youtube_url)
+                result = await self.add_youtube_to_queue(ctx, youtube_url)
                 if isinstance(result, str):
                     added_tracks.append(result)
         elif "album" in url:
@@ -129,7 +120,7 @@ class Music(commands.Cog):
                 search_query = f"{track['name']} {track['artists'][0]['name']}"
                 youtube_url = await self.search_youtube(search_query)
                 if youtube_url:
-                    result = await self.add_youtube_to_queue(youtube_url)
+                    result = await self.add_youtube_to_queue(ctx, youtube_url)
                     if isinstance(result, str):
                         added_tracks.append(result)
         elif "playlist" in url:
@@ -139,10 +130,28 @@ class Music(commands.Cog):
                 search_query = f"{track['name']} {track['artists'][0]['name']}"
                 youtube_url = await self.search_youtube(search_query)
                 if youtube_url:
-                    result = await self.add_youtube_to_queue(youtube_url)
+                    result = await self.add_youtube_to_queue(ctx, youtube_url)
                     if isinstance(result, str):
                         added_tracks.append(result)
         return added_tracks
+
+    async def add_youtube_to_queue(self, ctx, url: str) -> Union[str, List[str]]:
+        info = await self.extract_info(url, download=False)
+        if info is None:
+            return f"Не удалось добавить трек в очередь: {url}"
+
+        guild_id = ctx.guild.id
+        state = self.guild_states.setdefault(guild_id, {'queue': [], 'last_played': None, 'voice_client': ctx.voice_client, 'text_channel': ctx.channel})
+
+        if info.get("_type") == "playlist":
+            added_tracks = []
+            for entry in info["entries"]:
+                state['queue'].append(entry)
+                added_tracks.append(entry['title'])
+            return added_tracks
+        else:
+            state['queue'].append(info)
+            return info['title']
 
     async def search_youtube(self, query):
         search_url = f"ytsearch1:{query}"
@@ -151,233 +160,197 @@ class Music(commands.Cog):
             return info['entries'][0]['webpage_url']
         return None
 
-    async def download_and_play(self, track):
-        if not isinstance(track, dict) or 'info' not in track:
-            await self.send_error_message(f"Некорректная информация о треке: {track}")
-            await self.play_next_track()
+    async def download_and_play(self, ctx, track):
+        if not isinstance(track, dict):
+            await self.send_error_message(ctx.channel, f"Некорректная информация о треке: {track}")
+            await self.play_next_track(ctx)
             return
 
-        info = track['info']
+        info = track
         url = info.get('url')
         webpage_url = info.get('webpage_url')
 
         if not url and webpage_url:
-            try:
-                extracted_info = await self.extract_info(webpage_url, download=False)
-                if extracted_info and 'url' in extracted_info:
-                    url = extracted_info['url']
-                else:
-                    await self.send_error_message(f"Не удалось получить URL для трека: {info.get('title', 'Unknown')}")
-                    await self.play_next_track()
-                    return
-            except Exception as e:
-                await self.send_error_message(f"Ошибка при извлечении информации: {str(e)}")
-                await self.play_next_track()
+            extracted_info = await self.extract_info(webpage_url, download=False)
+            if extracted_info and 'url' in extracted_info:
+                url = extracted_info['url']
+                info = extracted_info
+            else:
+                await self.send_error_message(ctx.channel, f"Не удалось получить URL для трека: {info.get('title', 'Unknown')}")
+                await self.play_next_track(ctx)
                 return
 
         if not url:
-            await self.send_error_message(f"Отсутствует URL для трека: {info.get('title', 'Unknown')}")
-            await self.play_next_track()
+            await self.send_error_message(ctx.channel, f"Отсутствует URL для трека: {info.get('title', 'Unknown')}")
+            await self.play_next_track(ctx)
             return
 
-        try:
-            self.ctx.voice_client.play(discord.FFmpegPCMAudio(source=url,
-                                                              before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"),
-                                       after=lambda x: self.loop.create_task(self.after_playing(x)))
-            self.current_playing = f"{info.get('title', 'Неизвестно')} - {webpage_url or 'Нет URL'}"
-            self.last_played = discord.utils.utcnow()
+        source = discord.FFmpegPCMAudio(url, before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
+        ctx.voice_client.play(source, after=lambda e: self.bot.loop.create_task(self.after_playing(ctx, e)))
 
-            embed = await self.create_embed("🎵 Сейчас играет", f"🎶 {self.current_playing}")
-            await self.ctx.respond(embed=embed)
-        except Exception as e:
-            await self.send_error_message(f"Ошибка при воспроизведении трека: {str(e)}")
-            await self.play_next_track()
+        guild_id = ctx.guild.id
+        state = self.guild_states.get(guild_id)
+        if state:
+            state['current_playing'] = f"{info.get('title', 'Неизвестно')} - {webpage_url or 'Нет URL'}"
+            state['last_played'] = discord.utils.utcnow()
 
-    async def after_playing(self, error=None):
+        embed = self.create_embed("🎵 Сейчас играет", f"🎶 {state['current_playing']}")
+        await ctx.respond(embed=embed)
+
+    async def after_playing(self, ctx, error=None):
         if error:
-            await self.send_error_message(f"Произошла ошибка при воспроизведении: {str(error)}")
+            await self.send_error_message(ctx.channel, f"Произошла ошибка при воспроизведении: {str(error)}")
 
-        if self.ctx.voice_client:
-            if not self.queue_manager.is_empty():
-                await self.play_next_track()
+        guild_id = ctx.guild.id
+        state = self.guild_states.get(guild_id)
+
+        if state:
+            if not state['queue']:
+                state['current_playing'] = None
+                embed = self.create_embed("📢 Информация", "Очередь закончилась. Добавьте больше треков!")
+                await ctx.respond(embed=embed)
             else:
-                self.current_playing = None
-                self.first_time = True
-                embed = await self.create_embed("📢 Информация", "Очередь закончилась. Добавьте больше треков!")
-                await self.ctx.respond(embed=embed)
-        else:
-            self.current_playing = None
-            self.first_time = True
-        self.last_played = discord.utils.utcnow()
+                await self.play_next_track(ctx)
 
-    async def play_next_track(self):
-        if not self.ctx.voice_client or not self.ctx.voice_client.is_connected():
-            embed = await self.create_embed("❗ Внимание",
-                                            "Бот не подключен к голосовому каналу. Пытаюсь переподключиться...")
-            await self.ctx.respond(embed=embed)
-            try:
-                await self.ctx.author.voice.channel.connect()
-            except AttributeError:
-                await self.send_error_message("Вы должны быть в голосовом канале, чтобы воспроизводить музыку.")
-                return
-            except discord.errors.ClientException:
-                await self.send_error_message(
-                    "Не удалось подключиться к голосовому каналу. Пожалуйста, попробуйте снова.")
-                return
+    async def play_next_track(self, ctx):
+        guild_id = ctx.guild.id
+        state = self.guild_states.get(guild_id)
+        if state:
+            if not ctx.voice_client or not ctx.voice_client.is_connected():
+                try:
+                    await ctx.author.voice.channel.connect()
+                except Exception as e:
+                    await self.send_error_message(ctx.channel, "Не удалось подключиться к голосовому каналу. Пожалуйста, попробуйте снова.")
+                    return
 
-        next_track = self.queue_manager.get_next()
-        if next_track:
-            try:
-                await self.download_and_play(next_track)
-            except Exception as e:
-                await self.send_error_message(
-                    f"Произошла ошибка при воспроизведении трека: {str(e)}. Перехожу к следующему треку.")
-                await self.play_next_track()
-        else:
-            embed = await self.create_embed("📢 Информация", "Очередь пуста!")
-            await self.ctx.respond(embed=embed)
-            self.current_playing = None
-            self.first_time = True
+            if state['queue']:
+                next_track = state['queue'].pop(0)
+                await self.download_and_play(ctx, next_track)
+            else:
+                embed = self.create_embed("📢 Информация", "Очередь пуста!")
+                await ctx.respond(embed=embed)
+                state['current_playing'] = None
 
     @commands.slash_command(name="play", description="Воспроизвести музыку с Spotify или YouTube")
     async def play(self, ctx, *, url: Option(str, "URL или название трека", required=True)):
         await ctx.defer()
-        self.ctx = ctx
-
         if not ctx.author.voice:
-            embed = await self.create_embed("❌ Ошибка",
-                                            "Вы должны быть в голосовом канале, чтобы использовать эту команду!",
-                                            discord.Color.red())
+            embed = self.create_embed("❌ Ошибка",
+                                        "Вы должны быть в голосовом канале, чтобы использовать эту команду!",
+                                        discord.Color.red())
             await ctx.respond(embed=embed)
             return
 
-        channel = ctx.author.voice.channel
-
-        if ctx.voice_client and ctx.voice_client.channel != channel:
-            old_channel = ctx.voice_client.channel.name
+        if ctx.voice_client and ctx.voice_client.channel != ctx.author.voice.channel:
             await ctx.voice_client.disconnect()
-            self.queue_manager.clear_queue()
-            await channel.connect()
-            embed = await self.create_embed("🔄 Смена канала",
-                                            f"Я покинул канал **{old_channel}** и подключился к **{channel.name}**!")
-            await ctx.respond(embed=embed)
+            await ctx.author.voice.channel.connect()
         elif not ctx.voice_client:
-            await channel.connect()
+            await ctx.author.voice.channel.connect()
 
-        if not ctx.voice_client or not ctx.voice_client.is_connected():
-            embed = await self.create_embed("❌ Ошибка",
-                                            "Не удалось подключиться к голосовому каналу. Попробуйте позже.",
-                                            discord.Color.red())
-            await ctx.respond(embed=embed)
-            return
-
-        await self.add_to_queue(url)
+        await self.add_to_queue(ctx, url)
 
         if not ctx.voice_client.is_playing():
-            await self.play_next_track()
+            await self.play_next_track(ctx)
 
     @commands.slash_command(name="queue", description="Показать текущую очередь")
     async def show_queue(self, ctx):
-        if not self.queue_manager.is_empty() or self.current_playing:
-            queue_pages = []
-            items_per_page = 10
+        guild_id = ctx.guild.id
+        state = self.guild_states.get(guild_id)
+        if state:
+            queue = state.get('queue', [])
+            current_playing = state.get('current_playing')
 
-            for i in range(0, len(self.queue_manager.queue), items_per_page):
-                page_items = self.queue_manager.queue[i:i + items_per_page]
-                embed = discord.Embed(title="🎶 Текущая очередь", color=discord.Color.blue())
-                embed.set_thumbnail(url="https://i.imgur.com/nVFj1iD.png")  # Replace with your bot's logo URL
+            if queue or current_playing:
+                queue_pages = []
+                items_per_page = 10
 
-                if self.current_playing and i == 0:
-                    embed.add_field(name="▶️ Сейчас играет", value=f"**{self.current_playing}**", inline=False)
+                for i in range(0, len(queue), items_per_page):
+                    page_items = queue[i:i + items_per_page]
+                    embed = discord.Embed(title="🎶 Текущая очередь", color=discord.Color.blue())
 
-                for idx, track in enumerate(page_items, i + 1):
-                    embed.add_field(name=f"{idx}. {track['info']['title']}",
-                                    value=f"[🔗]({track['info']['original_url']}) | ⏱️ {self.format_duration(track['info'].get('duration', 0))}",
-                                    inline=False)
+                    if current_playing and i == 0:
+                        embed.add_field(name="▶️ Сейчас играет", value=f"**{current_playing}**", inline=False)
 
-                embed.set_footer(
-                    text=f"Страница {i // items_per_page + 1} из {-(-len(self.queue_manager.queue) // items_per_page)} | 🎵 Музыкальный бот")
-                queue_pages.append(embed)
+                    for idx, track in enumerate(page_items, i + 1):
+                        embed.add_field(name=f"{idx}. {track['title']}",
+                                        value=f"[🔗]({track['webpage_url']}) | ⏱️ {self.format_duration(track.get('duration', 0))}",
+                                        inline=False)
 
-            if queue_pages:
-                paginator = discord.ui.View()
-                paginator.add_item(
-                    discord.ui.Button(label="⬅️ Предыдущая", style=discord.ButtonStyle.primary, custom_id="previous"))
-                paginator.add_item(
-                    discord.ui.Button(label="Следующая ➡️", style=discord.ButtonStyle.primary, custom_id="next"))
+                    embed.set_footer(
+                        text=f"Страница {i // items_per_page + 1} из {-(-len(queue) // items_per_page)} | 🎵 Музыкальный бот")
+                    queue_pages.append(embed)
 
-                message = await ctx.respond(embed=queue_pages[0], view=paginator)
+                if queue_pages:
+                    message = await ctx.respond(embed=queue_pages[0])
 
-                current_page = 0
-
-                async def button_callback(interaction):
-                    nonlocal current_page
-                    if interaction.custom_id == "previous":
-                        current_page = (current_page - 1) % len(queue_pages)
-                    elif interaction.custom_id == "next":
-                        current_page = (current_page + 1) % len(queue_pages)
-
-                    await interaction.response.edit_message(embed=queue_pages[current_page])
-
-                paginator.children[0].callback = button_callback
-                paginator.children[1].callback = button_callback
+                    if len(queue_pages) > 1:
+                        await self.paginate(ctx, message, queue_pages)
+                else:
+                    embed = self.create_embed("Текущая очередь", "В очереди нет треков, но сейчас что-то играет.")
+                    await ctx.respond(embed=embed)
             else:
-                embed = await self.create_embed("Текущая очередь", "В очереди нет треков, но сейчас что-то играет.")
+                embed = self.create_embed("Очередь пуста", "Добавьте треки с помощью команды **/play**!")
                 await ctx.respond(embed=embed)
         else:
-            embed = await self.create_embed("Очередь пуста", "Добавьте треки с помощью команды **/play**!")
+            embed = self.create_embed("Очередь пуста", "Добавьте треки с помощью команды **/play**!")
             await ctx.respond(embed=embed)
 
-    @commands.slash_command(name="skip_tracks", description="Скипнуть n треков")
-    async def skip_tracks(self, ctx, num_tracks: int):
-        if num_tracks <= 0:
-            await ctx.respond("Количество треков должно быть больше нуля")
-            return
+    async def paginate(self, ctx, message, embeds):
+        current_page = 0
 
-        if ctx.voice_client and ctx.voice_client.is_playing():
-            skipped = 0
-            for _ in range(num_tracks):
-                if not self.queue_manager.is_empty():
-                    self.queue_manager.get_next()
-                    skipped += 1
-                else:
-                    break
+        buttons = [
+            discord.ui.Button(emoji="⬅️", style=discord.ButtonStyle.primary),
+            discord.ui.Button(emoji="➡️", style=discord.ButtonStyle.primary)
+        ]
 
-            ctx.voice_client.stop()
-            embed = await self.create_embed("⏭️ Треки пропущены", f"Пропущено {skipped} треков!")
-            await ctx.respond(embed=embed)
-        else:
-            embed = await self.create_embed("❌ Ошибка", "В данный момент ничего не играет", color=discord.Color.red())
-            await ctx.respond(embed=embed)
+        async def button_callback(interaction):
+            nonlocal current_page
+            if interaction.user != ctx.author:
+                await interaction.response.send_message("Вы не можете управлять этой страницей.", ephemeral=True)
+                return
+            if interaction.component.emoji.name == "⬅️":
+                current_page = (current_page - 1) % len(embeds)
+            elif interaction.component.emoji.name == "➡️":
+                current_page = (current_page + 1) % len(embeds)
+            await interaction.response.edit_message(embed=embeds[current_page])
+
+        for button in buttons:
+            button.callback = button_callback
+
+        view = discord.ui.View()
+        for button in buttons:
+            view.add_item(button)
+
+        await message.edit(view=view)
 
     @commands.slash_command(name="skip", description="Пропустить текущий трек")
     async def skip(self, ctx):
         if ctx.voice_client and ctx.voice_client.is_playing():
             ctx.voice_client.stop()
-            embed = await self.create_embed("⏭️ Трек пропущен", "Переходим к следующему треку в очереди!")
+            embed = self.create_embed("⏭️ Трек пропущен", "Переходим к следующему треку в очереди!")
             await ctx.respond(embed=embed)
         else:
-            embed = await self.create_embed("❌ Ошибка", "Сейчас ничего не играет", color=discord.Color.red())
+            embed = self.create_embed("❌ Ошибка", "Сейчас ничего не играет", color=discord.Color.red())
             await ctx.respond(embed=embed)
 
     @commands.slash_command(name="pause", description="Приостановить воспроизведение")
     async def pause(self, ctx):
         if ctx.voice_client and ctx.voice_client.is_playing():
             ctx.voice_client.pause()
-            embed = await self.create_embed("⏸️ Пауза", "Музыка приостановлена. Используйте /resume, чтобы продолжить.")
+            embed = self.create_embed("⏸️ Пауза", "Музыка приостановлена. Используйте /resume, чтобы продолжить.")
             await ctx.respond(embed=embed)
         else:
-            embed = await self.create_embed("❌ Ошибка", "Нечего ставить на паузу!", color=discord.Color.red())
+            embed = self.create_embed("❌ Ошибка", "Нечего ставить на паузу!", color=discord.Color.red())
             await ctx.respond(embed=embed)
 
     @commands.slash_command(name="resume", description="Возобновить воспроизведение")
     async def resume(self, ctx):
         if ctx.voice_client and ctx.voice_client.is_paused():
             ctx.voice_client.resume()
-            embed = await self.create_embed("▶️ Возобновление", "Музыка снова играет!")
+            embed = self.create_embed("▶️ Возобновление", "Музыка снова играет!")
             await ctx.respond(embed=embed)
         else:
-            embed = await self.create_embed("❌ Ошибка", "Нечего возобновлять!", color=discord.Color.red())
+            embed = self.create_embed("❌ Ошибка", "Нечего возобновлять!", color=discord.Color.red())
             await ctx.respond(embed=embed)
 
     @commands.slash_command(name="stop", description="Остановить воспроизведение и очистить очередь")
@@ -385,25 +358,27 @@ class Music(commands.Cog):
         if ctx.voice_client:
             ctx.voice_client.stop()
             await ctx.voice_client.disconnect()
-            self.queue_manager.clear_queue()
-            self.last_played = None
-            embed = await self.create_embed("🛑 Остановлено",
-                                            "Воспроизведение остановлено, очередь очищена. До новых встреч!")
+            guild_id = ctx.guild.id
+            if guild_id in self.guild_states:
+                del self.guild_states[guild_id]
+            embed = self.create_embed("🛑 Остановлено",
+                                      "Воспроизведение остановлено, очередь очищена. До новых встреч!")
             await ctx.respond(embed=embed)
         else:
-            embed = await self.create_embed("❌ Ошибка", "Я не нахожусь в голосовом канале!",
-                                            color=discord.Color.red())
+            embed = self.create_embed("❌ Ошибка", "Я не нахожусь в голосовом канале!",
+                                      color=discord.Color.red())
             await ctx.respond(embed=embed)
 
     @commands.slash_command(name="now_playing", description="Показать информацию о текущем треке")
     async def now_playing(self, ctx):
-        if self.current_playing:
-            embed = await self.create_embed("🎵 Сейчас играет", f"🎶 {self.current_playing}")
+        guild_id = ctx.guild.id
+        state = self.guild_states.get(guild_id)
+        if state and state.get('current_playing'):
+            embed = self.create_embed("🎵 Сейчас играет", f"🎶 {state['current_playing']}")
             await ctx.respond(embed=embed)
         else:
-            embed = await self.create_embed("❌ Ошибка", "Сейчас ничего не играет", color=discord.Color.red())
+            embed = self.create_embed("❌ Ошибка", "Сейчас ничего не играет", color=discord.Color.red())
             await ctx.respond(embed=embed)
-
 
 def setup(bot):
     bot.add_cog(Music(bot))
