@@ -1,5 +1,4 @@
-# Используем базовый образ Python
-FROM python:3.12.8-slim
+FROM --platform=linux/arm64/v8 python:3.12.8-slim
 
 # Устанавливаем рабочую директорию
 WORKDIR /app
@@ -14,7 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем файлы приложения
 COPY main.py .
-# Да-да, это не безопасно, но мне лень вставлять токен вручную
 COPY .env .
 COPY cogs/ ./cogs/
 COPY utils/ ./utils/
