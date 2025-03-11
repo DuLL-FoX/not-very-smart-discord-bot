@@ -1,5 +1,5 @@
 # Используем базовый образ Python
-FROM arm64v8/python:3.11.8-slim
+FROM python:3.12.8-slim
 
 # Устанавливаем рабочую директорию
 WORKDIR /app

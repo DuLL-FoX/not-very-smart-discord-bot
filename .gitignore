@@ -2,3 +2,6 @@
 /.cache
 /.venv/
 /.idea/
+utils/__pycache__/*
+cogs/__pycache__/*
+/data/
