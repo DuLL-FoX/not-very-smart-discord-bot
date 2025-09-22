@@ -75,7 +75,6 @@ class TYD(commands.Cog):
         embed.add_field(name="Число", value=str(random_number), inline=True)
         if role_to_assign:
             embed.add_field(name="Роль", value=role_to_assign, inline=True)
-        embed.set_footer(text="/tyd можно раз в 24 часа")
         await ctx.respond(embed=embed)
 
     async def assign_role_and_update_db(self, ctx, role_name, expiration):
