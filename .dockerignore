@@ -1,1 +1,22 @@
 venv/
+.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# VCS and editor files
+.git
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and temp
+*.log
+*.tmp
+
+# Local data/output not needed at build time
+downloads/

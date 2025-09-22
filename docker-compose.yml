@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  discord-bot:
+    image: dullfox/not-very-smart-discord-bot:latest
+    container_name: discord-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
