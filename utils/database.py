@@ -151,3 +151,93 @@ class Database:
     def _read_file_sync(self, path):
         with open(path, 'r', encoding='utf-8') as f:
             return f.read()
+
+    
+    async def add_dtek_address(
+        self,
+        region: str,
+        city: str,
+        street: str,
+        house: str,
+        label: str,
+        guild_id: int,
+        channel_id: int,
+    ) -> int:
+        """Add a new DTEK monitored address."""
+        await self.connect()
+        row = await self.conn.fetchrow(
+            """
+            INSERT INTO dtek_addresses (region, city, street, house, label, guild_id, channel_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (guild_id, label) DO UPDATE SET
+                region = EXCLUDED.region,
+                city = EXCLUDED.city,
+                street = EXCLUDED.street,
+                house = EXCLUDED.house,
+                channel_id = EXCLUDED.channel_id,
+                updated_at = NOW()
+            RETURNING id
+            """,
+            region, city, street, house, label, guild_id, channel_id
+        )
+        return row['id']
+
+    async def remove_dtek_address(self, guild_id: int, label: str) -> bool:
+        """Remove a DTEK monitored address by label."""
+        await self.connect()
+        result = await self.conn.execute(
+            "DELETE FROM dtek_addresses WHERE guild_id = $1 AND label = $2",
+            guild_id, label
+        )
+        return result == "DELETE 1"
+
+    async def get_dtek_addresses(self) -> list:
+        """Get all DTEK monitored addresses."""
+        await self.connect()
+        rows = await self.conn.fetch(
+            """
+            SELECT id, region, city, street, house, label, guild_id, channel_id, message_id
+            FROM dtek_addresses
+            ORDER BY guild_id, channel_id, label
+            """
+        )
+        return [dict(row) for row in rows]
+
+    async def get_dtek_addresses_for_guild(self, guild_id: int) -> list:
+        """Get DTEK monitored addresses for a specific guild."""
+        await self.connect()
+        rows = await self.conn.fetch(
+            """
+            SELECT id, region, city, street, house, label, guild_id, channel_id, message_id
+            FROM dtek_addresses
+            WHERE guild_id = $1
+            ORDER BY channel_id, label
+            """,
+            guild_id
+        )
+        return [dict(row) for row in rows]
+
+    async def update_dtek_message_id(self, address_id: int, message_id: int) -> None:
+        """Update the message ID for a DTEK address."""
+        await self.connect()
+        await self.conn.execute(
+            """
+            UPDATE dtek_addresses 
+            SET message_id = $2, updated_at = NOW()
+            WHERE id = $1
+            """,
+            address_id, message_id
+        )
+
+    async def update_dtek_address_channel(self, guild_id: int, label: str, channel_id: int) -> bool:
+        """Update the channel for a DTEK address and reset message_id."""
+        await self.connect()
+        result = await self.conn.execute(
+            """
+            UPDATE dtek_addresses 
+            SET channel_id = $3, message_id = NULL, updated_at = NOW()
+            WHERE guild_id = $1 AND label = $2
+            """,
+            guild_id, label, channel_id
+        )
+        return result == "UPDATE 1"

@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   discord-bot:
     image: dullfox/not-very-smart-discord-bot:latest

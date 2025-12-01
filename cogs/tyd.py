@@ -110,7 +110,6 @@ class TYD(commands.Cog):
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove)
 
-    # ===== Owner-only utilities =====
     def _dummy_ctx_for_member(self, base_ctx: discord.ApplicationContext, member: discord.Member):
         return SimpleNamespace(author=member, guild=base_ctx.guild, channel=base_ctx.channel)
 
@@ -120,7 +119,7 @@ class TYD(commands.Cog):
         target = user or ctx.author
         dummy_ctx = self._dummy_ctx_for_member(ctx, target)
         try:
-            self.tyd.reset_cooldown(dummy_ctx)  # type: ignore[attr-defined]
+            self.tyd.reset_cooldown(dummy_ctx)
             await ctx.respond(f"Сброшен кулдаун /tyd для {target.mention}.", ephemeral=True)
         except Exception as e:
             await ctx.respond(f"Не удалось сбросить кулдаун: {e}", ephemeral=True)
@@ -131,7 +130,7 @@ class TYD(commands.Cog):
         target = user or ctx.author
         dummy_ctx = self._dummy_ctx_for_member(ctx, target)
         try:
-            seconds = float(self.tyd.get_cooldown_retry_after(dummy_ctx))  # type: ignore[attr-defined]
+            seconds = float(self.tyd.get_cooldown_retry_after(dummy_ctx))
             if seconds <= 0:
                 await ctx.respond(f"У {target.mention} нет кулдауна на /tyd.", ephemeral=True)
             else:

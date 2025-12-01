@@ -1,7 +1,3 @@
--- 001_init.sql
--- Initial schema for roles and phrases tables
-
--- Roles table: tracks temporary role assignments
 CREATE TABLE IF NOT EXISTS roles (
     user_id BIGINT NOT NULL,
     role TEXT NOT NULL,
@@ -9,21 +5,17 @@ CREATE TABLE IF NOT EXISTS roles (
     expiration TIMESTAMP NOT NULL
 );
 
--- Helpful indexes
 CREATE INDEX IF NOT EXISTS idx_roles_user_id ON roles(user_id);
 CREATE INDEX IF NOT EXISTS idx_roles_expiration ON roles(expiration);
 
--- Phrases table: stores message templates selected by range_key
 CREATE TABLE IF NOT EXISTS phrases (
     id SERIAL PRIMARY KEY,
     range_key TEXT NOT NULL,
     message TEXT NOT NULL
 );
 
--- Optional: index to speed up lookups by range_key
 CREATE INDEX IF NOT EXISTS idx_phrases_range_key ON phrases(range_key);
 
--- Minimal seed phrases (safe defaults). These INSERTs are idempotent.
 INSERT INTO phrases(range_key, message)
 SELECT 'default', '{user_mention}, тебе выпало {random_number}. {bot_mention} записал это в книгу судьбы!'
 WHERE NOT EXISTS (

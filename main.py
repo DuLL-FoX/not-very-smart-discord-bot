@@ -47,13 +47,13 @@ async def startup_health_checks() -> None:
         logger.warning("FFmpeg not found in PATH. Audio playback may fail.")
 
     try:
-        import yt_dlp  # type: ignore
+        import yt_dlp
         logger.info("yt-dlp version: %s", getattr(yt_dlp, "version", getattr(yt_dlp, "__version__", "unknown")))
     except Exception as e:
         logger.warning("yt-dlp import failed: %s", e)
 
     try:
-        import spotipy  # type: ignore
+        import spotipy
         logger.info("spotipy version: %s", getattr(spotipy, "__version__", "unknown"))
         if not os.getenv("SPOTIFY_CLIENT_ID") or not os.getenv("SPOTIFY_CLIENT_SECRET"):
             logger.warning("Spotify credentials not set. Spotify URLs won't resolve.")
@@ -87,22 +87,38 @@ async def on_ready():
     try:
         app_cmds = getattr(bot, "application_commands", [])
         logger.info("Application commands registered: %d", len(app_cmds))
-    except Exception:
-        pass
+        
+        logger.info("Syncing slash commands to Discord...")
+        await bot.sync_commands()
+        logger.info("Slash commands synced successfully")
+    except Exception as e:
+        logger.warning(f"Failed to sync commands: {e}")
 @bot.event
 async def on_application_command_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.respond(
-            f"Можешь так не спешить, у тебя ещё {str(timedelta(seconds=int(error.retry_after)))} кулдауна.")
+        try:
+            await ctx.respond(
+                f"Можешь так не спешить, у тебя ещё {str(timedelta(seconds=int(error.retry_after)))} кулдауна.")
+        except discord.HTTPException:
+            pass
     elif isinstance(error, discord.errors.NotFound):
-        await ctx.respond("Честно говоря, я не ебу что это за ошибка, но я добавил её обработку.")
+        try:
+            await ctx.respond("Честно говоря, я не ебу что это за ошибка, но я добавил её обработку.")
+        except discord.HTTPException:
+            pass
     else:
         logging.getLogger("commands").exception("Unhandled application command error: %s", error)
-        raise error
+        try:
+            if ctx.response.is_done():
+                await ctx.followup.send(f":x: Невідома помилка: {type(error).__name__}", ephemeral=True)
+            else:
+                await ctx.respond(f":x: Невідома помилка: {type(error).__name__}", ephemeral=True)
+        except discord.HTTPException:
+            pass
 
-# Load extensions
 bot.load_extension("cogs.tyd")
 bot.load_extension("cogs.music")
+bot.load_extension("cogs.dtek")
 logger.info("Extensions loaded: %s", ", ".join(sorted(bot.cogs.keys())) or "none")
 
 token = os.getenv('DISCORD_TOKEN')
