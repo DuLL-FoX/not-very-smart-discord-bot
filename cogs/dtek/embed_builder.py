@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import List, Tuple
 
+from zoneinfo import ZoneInfo
+
 import discord
 
 from .constants import DTEK_REGIONS, STATUS_MARKERS, STATUS_CHARS
@@ -10,6 +12,10 @@ from .models import PowerStatus
 
 
 class EmbedBuilder:
+    DIVIDER = "─" * 32
+    DIVIDER_THIN = "┄" * 28
+    KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
     @staticmethod
     def build_schedule_graph(schedule_blocks: List[Tuple[str, str, str]], current_time: datetime) -> str:
         if not schedule_blocks:
@@ -23,9 +29,10 @@ class EmbedBuilder:
             prefix = STATUS_CHARS.get(status, " ")
 
             is_current = start <= current_time_str < end
-            marker = " <" if is_current else ""
+            marker = "  <<" if is_current else ""
 
-            lines.append(f"{prefix} {start}-{end} {status_label}{marker}")
+            time_range = f"{start} - {end}"
+            lines.append(f"{prefix} {time_range:<13} {status_label}{marker}")
 
         return "```diff\n" + "\n".join(lines) + "\n```"
 
@@ -39,7 +46,7 @@ class EmbedBuilder:
             return ""
 
         action = "Вимкнення" if status.next_change_status in ("no", "maybe") else "Увімкнення"
-        return f"\n{action} о **{status.next_change}**"
+        return f"Очікується: **{action}** о `{status.next_change}`"
 
     @classmethod
     def build_status_embed(cls, statuses: List[PowerStatus]) -> discord.Embed:
@@ -54,10 +61,10 @@ class EmbedBuilder:
                 overall_status = "maybe"
 
         color_map = {
-            "yes": discord.Color.from_rgb(87, 242, 135),
-            "no": discord.Color.from_rgb(237, 66, 69),
-            "maybe": discord.Color.from_rgb(254, 231, 92),
-            "error": discord.Color.from_rgb(149, 165, 166),
+            "yes": discord.Color.from_rgb(67, 181, 129),
+            "no": discord.Color.from_rgb(240, 71, 71),
+            "maybe": discord.Color.from_rgb(250, 166, 26),
+            "error": discord.Color.from_rgb(116, 127, 141),
         }
 
         embed = discord.Embed(
@@ -66,21 +73,22 @@ class EmbedBuilder:
             timestamp=datetime.now(timezone.utc),
         )
 
-        now = datetime.now()
+        now = datetime.now(cls.KYIV_TZ)
 
-        for status in statuses:
+        for idx, status in enumerate(statuses):
             region_config = DTEK_REGIONS.get(status.address.region, DTEK_REGIONS["krem"])
 
             status_marker = cls.get_status_marker(status.current_status)
 
-            header = f"{status_marker} {status.address.label}"
+            header = f"{status_marker}  {status.address.label}"
 
             field_parts = []
 
+            address_parts = []
             if region_config.get("has_city", True):
-                field_parts.append(f"{status.address.city}")
-            field_parts.append(f"{status.address.street}, {status.address.house}")
-            field_parts.append("")
+                address_parts.append(status.address.city)
+            address_parts.append(f"{status.address.street}, {status.address.house}")
+            field_parts.append(f"`{' / '.join(address_parts)}`")
 
             status_text = status.current_status_label
             if status.current_status == "yes":
@@ -97,15 +105,15 @@ class EmbedBuilder:
                 field_parts.append(next_change_info)
 
             if status.schedule_blocks:
-                field_parts.append("")
-                field_parts.append("**Графік на сьогодні:**")
+                field_parts.append(f"\n**Графік на сьогодні**")
                 graph = cls.build_schedule_graph(status.schedule_blocks, now)
                 field_parts.append(graph)
 
             if status.error:
-                field_parts.append(f"\n**Помилка:** {status.error}")
+                field_parts.append(f"**Помилка:** `{status.error}`")
 
-            field_parts.append(f"\n`{region_config['short_name']}`")
+            if idx < len(statuses) - 1:
+                field_parts.append(f"\n{cls.DIVIDER_THIN}")
 
             embed.add_field(
                 name=header,
@@ -113,14 +121,21 @@ class EmbedBuilder:
                 inline=False,
             )
 
+        legend = (
+            f"```\n"
+            f"[+] Є світло    [-] Немає світла\n"
+            f"[~] Можливе     <<  Поточний час\n"
+            f"```"
+        )
+
         embed.add_field(
-            name="",
-            value="━━━━━━━━━━━━━━━━━━━━━━━━━\n[+] Є світло | [-] Немає | [~] Можливе | < Зараз",
+            name=cls.DIVIDER,
+            value=legend,
             inline=False,
         )
 
         embed.set_footer(
-            text="Оновлено | Автооновлення кожні 15 хв",
+            text="Автооновлення кожні 15 хв",
             icon_url="https://www.dtek-krem.com.ua/favicon.ico"
         )
 
