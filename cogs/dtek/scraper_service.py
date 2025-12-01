@@ -105,12 +105,17 @@ class ScraperService:
         return self._cache.get(region)
 
     async def _fetch_with_browser(self, base_url: str, headless: bool = True, page_timeout: int = 30000) -> Tuple[str, str]:
+        logger.info(f"[SCRAPER] _fetch_with_browser called for base_url={base_url}, headless={headless}, timeout={page_timeout}")
+
         try:
+            logger.debug(f"[SCRAPER] Importing Camoufox...")
             from camoufox.async_api import AsyncCamoufox
+            logger.debug(f"[SCRAPER] Camoufox imported successfully")
         except ImportError as exc:
+            logger.exception(f"[SCRAPER] CRITICAL: Camoufox import failed")
             raise RuntimeError("Camoufox is required. Install it via 'pip install camoufox'.") from exc
 
-        logger.info("Launching browser to bypass Incapsula...")
+        logger.info(f"[SCRAPER] Launching Camoufox browser (headless={headless})...")
 
         firefox_prefs = {
             "network.dns.disablePrefetch": True,
@@ -118,31 +123,73 @@ class ScraperService:
             "network.proxy.type": 0,
         }
 
-        async with AsyncCamoufox(headless=headless, firefox_user_prefs=firefox_prefs) as browser_instance:
-            page = await browser_instance.new_page()
+        browser_instance = None
+        page = None
 
-            try:
-                await page.goto(
-                    f"{base_url}{SHUTDOWNS_PATH}",
-                    wait_until="domcontentloaded",
-                    timeout=30000
-                )
+        try:
+            logger.debug(f"[SCRAPER] Creating AsyncCamoufox instance...")
+            async with AsyncCamoufox(headless=headless, firefox_user_prefs=firefox_prefs) as browser_instance:
+                logger.info(f"[SCRAPER] Browser instance created successfully")
 
-                await page.wait_for_selector("#discon_form", timeout=page_timeout)
-                await page.wait_for_load_state("networkidle", timeout=10000)
+                logger.debug(f"[SCRAPER] Creating new page...")
+                page = await browser_instance.new_page()
+                logger.info(f"[SCRAPER] New page created")
 
-                html = await page.content()
-                context = page.context
-                cookies = await context.cookies()
-                cookie_header = "; ".join(
-                    f"{cookie.get('name', '')}={cookie.get('value', '')}"
-                    for cookie in cookies
-                    if cookie.get('name')
-                )
-                return html, cookie_header
-            except Exception as e:
-                logger.error(f"Browser automation failed: {e}")
-                raise
+                try:
+                    target_url = f"{base_url}{SHUTDOWNS_PATH}"
+                    logger.info(f"[SCRAPER] Navigating to {target_url}...")
+                    await page.goto(
+                        target_url,
+                        wait_until="domcontentloaded",
+                        timeout=30000
+                    )
+                    logger.info(f"[SCRAPER] Page loaded (domcontentloaded)")
+
+                    logger.debug(f"[SCRAPER] Waiting for selector #discon_form...")
+                    await page.wait_for_selector("#discon_form", timeout=page_timeout)
+                    logger.info(f"[SCRAPER] Selector #discon_form found")
+
+                    logger.debug(f"[SCRAPER] Waiting for networkidle state...")
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                    logger.info(f"[SCRAPER] Network idle state reached")
+
+                    logger.debug(f"[SCRAPER] Extracting page content...")
+                    html = await page.content()
+                    logger.info(f"[SCRAPER] Page content extracted, length={len(html)} chars")
+
+                    logger.debug(f"[SCRAPER] Extracting cookies...")
+                    context = page.context
+                    cookies = await context.cookies()
+                    cookie_header = "; ".join(
+                        f"{cookie.get('name', '')}={cookie.get('value', '')}"
+                        for cookie in cookies
+                        if cookie.get('name')
+                    )
+                    logger.info(f"[SCRAPER] Extracted {len(cookies)} cookies")
+
+                    logger.info(f"[SCRAPER] Browser fetch completed successfully")
+                    return html, cookie_header
+
+                except asyncio.TimeoutError as e:
+                    logger.exception(f"[SCRAPER] CRITICAL: Browser operation timed out: {e}")
+                    raise
+                except Exception as e:
+                    logger.exception(f"[SCRAPER] CRITICAL: Browser page operation failed: {type(e).__name__}: {e}")
+                    raise
+                finally:
+                    if page:
+                        try:
+                            logger.debug(f"[SCRAPER] Closing page...")
+                            await page.close()
+                            logger.debug(f"[SCRAPER] Page closed")
+                        except Exception as e:
+                            logger.warning(f"[SCRAPER] Error closing page: {e}")
+
+        except Exception as e:
+            logger.exception(f"[SCRAPER] CRITICAL: Browser automation failed: {type(e).__name__}: {e}")
+            raise
+        finally:
+            logger.debug(f"[SCRAPER] _fetch_with_browser exiting")
 
     def _extract_between(self, html: str, start: str, end_pattern: str) -> str:
         pattern = rf"{re.escape(start)}\s*(\{{.*?\}})\s*(?={end_pattern})"
@@ -186,19 +233,43 @@ class ScraperService:
         return ScheduleData(preset=preset, fact=fact, csrf_token=csrf_token, cookie=cookie)
 
     async def fetch_schedule_data(self, region: str) -> ScheduleData:
+        logger.info(f"[SCRAPER] fetch_schedule_data called for region={region}")
+
         if region in self._cache:
+            logger.info(f"[SCRAPER] Cache hit for region {region}, returning cached data")
             return self._cache[region]
 
+        logger.debug(f"[SCRAPER] Cache miss for region {region}, acquiring lock...")
         async with self._scraper_lock:
+            logger.debug(f"[SCRAPER] Lock acquired for region {region}")
+
+            # Double-check cache after acquiring lock
             if region in self._cache:
+                logger.info(f"[SCRAPER] Cache populated while waiting for lock, returning cached data")
                 return self._cache[region]
 
+            logger.debug(f"[SCRAPER] Getting region configuration for {region}...")
             region_config = DTEK_REGIONS.get(region, DTEK_REGIONS["krem"])
             base_url = region_config["base_url"]
+            logger.info(f"[SCRAPER] Region config: base_url={base_url}")
 
-            html, cookie = await self._fetch_with_browser(base_url, headless=True, page_timeout=30000)
-            schedule_data = self._parse_schedule_from_html(html, cookie)
+            logger.info(f"[SCRAPER] Fetching data with browser for region {region}...")
+            try:
+                html, cookie = await self._fetch_with_browser(base_url, headless=True, page_timeout=30000)
+                logger.info(f"[SCRAPER] Browser fetch completed, parsing HTML...")
+            except Exception as e:
+                logger.exception(f"[SCRAPER] CRITICAL: Browser fetch failed for region {region}: {e}")
+                raise
+
+            try:
+                schedule_data = self._parse_schedule_from_html(html, cookie)
+                logger.info(f"[SCRAPER] HTML parsed successfully, caching data for region {region}")
+            except Exception as e:
+                logger.exception(f"[SCRAPER] CRITICAL: HTML parsing failed for region {region}: {e}")
+                raise
+
             self._cache[region] = schedule_data
+            logger.info(f"[SCRAPER] Schedule data cached for region {region}")
 
             return schedule_data
 
@@ -212,6 +283,8 @@ class ScraperService:
         preset: Dict,
         skip_city: bool = False,
     ) -> Dict:
+        logger.info(f"[SCRAPER] _post_address_lookup called: base_url={base_url}, city='{city}', street='{street}', skip_city={skip_city}")
+
         headers = {
             "User-Agent": USER_AGENT,
             "Referer": f"{base_url}{SHUTDOWNS_PATH}",
@@ -244,39 +317,78 @@ class ScraperService:
             payload[f"data[{update_fact_index}][name]"] = "updateFact"
             payload[f"data[{update_fact_index}][value]"] = str(update_fact)
 
+        logger.debug(f"[SCRAPER] Prepared payload with {len(payload)} fields")
+
+        session = None
         try:
+            logger.debug(f"[SCRAPER] Creating aiohttp session...")
             async with aiohttp.ClientSession() as session:
+                logger.debug(f"[SCRAPER] Session created, posting to {base_url}{AJAX_PATH}...")
+
                 async with session.post(
                     f"{base_url}{AJAX_PATH}",
                     data=payload,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as response:
-                    response.raise_for_status()
+                    logger.info(f"[SCRAPER] HTTP POST completed, status={response.status}")
+
+                    try:
+                        response.raise_for_status()
+                        logger.debug(f"[SCRAPER] Response status OK, parsing JSON...")
+                    except aiohttp.ClientResponseError as e:
+                        logger.error(f"[SCRAPER] HTTP error response: status={e.status}, message={e.message}")
+                        raise
+
                     data = await response.json()
+                    logger.info(f"[SCRAPER] Response parsed, result={data.get('result')}, has_data={bool(data.get('data'))}")
+
         except asyncio.TimeoutError as e:
+            logger.exception(f"[SCRAPER] Address lookup timed out after 30 seconds")
             raise NetworkException("Address lookup timed out after 30 seconds.") from e
         except aiohttp.ClientError as e:
+            logger.exception(f"[SCRAPER] Address lookup request failed: {type(e).__name__}: {e}")
             raise NetworkException(f"Address lookup request failed: {e}") from e
         except json.JSONDecodeError as e:
+            logger.exception(f"[SCRAPER] Failed to parse address lookup response as JSON")
             raise ParsingException(f"Failed to parse address lookup response as JSON: {e}") from e
+        except Exception as e:
+            logger.exception(f"[SCRAPER] Unexpected error in address lookup: {type(e).__name__}: {e}")
+            raise
+        finally:
+            if session and not session.closed:
+                try:
+                    logger.debug(f"[SCRAPER] Closing aiohttp session...")
+                    await session.close()
+                except Exception as e:
+                    logger.warning(f"[SCRAPER] Error closing session: {e}")
 
         if not data.get("result"):
             error_msg = data.get("error", "Unknown error")
+            logger.warning(f"[SCRAPER] Address lookup validation failed: {error_msg}")
             raise ValidationException(
                 f"Address lookup failed: {error_msg}. "
                 f"Please verify the city and street names are correct and in Ukrainian."
             )
 
+        logger.info(f"[SCRAPER] Address lookup successful, returning data")
         return data["data"]
 
     async def lookup_queue(self, region: str, city: str, street: str, house: str) -> str:
-        logger.debug(f"lookup_queue called: region={region}, city={city}, street={street}, house={house}")
+        logger.info(f"[SCRAPER] lookup_queue called: region={region}, city='{city}', street='{street}', house='{house}'")
 
         if region not in self._cache:
-            await self.fetch_schedule_data(region)
+            logger.debug(f"[SCRAPER] No cache for region {region}, fetching schedule data...")
+            try:
+                await self.fetch_schedule_data(region)
+                logger.info(f"[SCRAPER] Schedule data fetched for region {region}")
+            except Exception as e:
+                logger.exception(f"[SCRAPER] CRITICAL: Failed to fetch schedule data for region {region}: {e}")
+                raise
 
         cache = self._cache[region]
+        logger.debug(f"[SCRAPER] Using cached data for region {region}")
+
         region_config = DTEK_REGIONS.get(region, DTEK_REGIONS["krem"])
         base_url = region_config["base_url"]
         skip_city = not region_config.get("has_city", True)
@@ -288,19 +400,32 @@ class ScraperService:
             lookup_city = city
             lookup_street = street
 
-        logger.debug(f"Lookup params for {region}: city='{lookup_city}', street='{lookup_street}', skip_city={skip_city}")
+        logger.info(f"[SCRAPER] Lookup params: region={region}, city='{lookup_city}', street='{lookup_street}', skip_city={skip_city}")
 
-        house_data = await self._post_address_lookup(
-            base_url,
-            cache.csrf_token,
-            cache.cookie,
-            lookup_city,
-            lookup_street,
-            cache.preset,
-            skip_city,
-        )
+        try:
+            logger.debug(f"[SCRAPER] Posting address lookup request...")
+            house_data = await self._post_address_lookup(
+                base_url,
+                cache.csrf_token,
+                cache.cookie,
+                lookup_city,
+                lookup_street,
+                cache.preset,
+                skip_city,
+            )
+            logger.info(f"[SCRAPER] Address lookup returned {len(house_data)} house entries")
+        except Exception as e:
+            logger.exception(f"[SCRAPER] CRITICAL: Address lookup failed: {e}")
+            raise
 
-        return _pick_queue(house_data, house)
+        try:
+            logger.debug(f"[SCRAPER] Picking queue from house data for house '{house}'...")
+            queue = _pick_queue(house_data, house)
+            logger.info(f"[SCRAPER] Queue resolved: {queue}")
+            return queue
+        except Exception as e:
+            logger.exception(f"[SCRAPER] CRITICAL: Failed to pick queue for house '{house}': {e}")
+            raise
 
     def get_current_status(
         self, fact: dict, queue: str

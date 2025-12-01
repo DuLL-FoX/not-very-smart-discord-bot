@@ -19,11 +19,6 @@ logger = logging.getLogger("dtek_cog")
 
 
 class DTEKMonitor(commands.Cog):
-    dtek = discord.SlashCommandGroup(
-        name="dtek",
-        description="DTEK power shutdown monitoring",
-    )
-
     def __init__(self, bot: commands.Bot):
         logger.info("DTEKMonitor cog initializing...")
         self.bot = bot
@@ -36,27 +31,38 @@ class DTEKMonitor(commands.Cog):
         logger.info("Starting update_task loop...")
         self.update_task.start()
         self.health_check_task.start()
-        logger.info(f"DTEKMonitor cog initialized. Commands in group: {[cmd.name for cmd in self.dtek.walk_commands()]}")
+        logger.info(f"DTEKMonitor cog initialized")
 
     @commands.Cog.listener()
     async def on_ready(self):
-        logger.info(f"DTEKMonitor on_ready fired. Bot guilds: {len(self.bot.guilds)}")
-        logger.info(f"Registered application commands: {[cmd.name for cmd in self.bot.pending_application_commands]}")
+        logger.info(f"[DTEK_COG] on_ready event fired")
+        logger.info(f"[DTEK_COG] Bot user: {self.bot.user} (ID: {self.bot.user.id if self.bot.user else 'N/A'})")
+        logger.info(f"[DTEK_COG] Bot guilds: {len(self.bot.guilds)}")
+        logger.info(f"[DTEK_COG] Bot latency: {self.bot.latency * 1000:.2f}ms")
+        logger.info(f"[DTEK_COG] Pending application commands: {[cmd.name for cmd in self.bot.pending_application_commands]}")
 
     @commands.Cog.listener()
     async def on_application_command_error(self, ctx: discord.ApplicationContext, error: Exception):
         if ctx.command and ctx.command.cog != self:
             return
-        
-        logger.error(f"Slash command error in {ctx.command.name if ctx.command else 'unknown'}: {error}", exc_info=True)
-        
+
+        logger.error(f"[DTEK_COG] Application command error in {ctx.command.name if ctx.command else 'unknown'}: {type(error).__name__}: {error}", exc_info=True)
+        logger.error(f"[DTEK_COG] Error context - User: {ctx.author} (ID: {ctx.author.id}), Guild: {ctx.guild_id}, Channel: {ctx.channel_id}")
+        logger.error(f"[DTEK_COG] Response state: is_done={ctx.response.is_done()}")
+
         try:
             if ctx.response.is_done():
+                logger.debug(f"[DTEK_COG] Sending error via followup...")
                 await ctx.followup.send(f":x: Помилка: {error}", ephemeral=True)
+                logger.debug(f"[DTEK_COG] Error sent via followup")
             else:
+                logger.debug(f"[DTEK_COG] Sending error via respond...")
                 await ctx.respond(f":x: Помилка: {error}", ephemeral=True)
+                logger.debug(f"[DTEK_COG] Error sent via respond")
         except discord.HTTPException as e:
-            logger.warning(f"Failed to send error response: {e}")
+            logger.exception(f"[DTEK_COG] CRITICAL: Failed to send error response: {e}, status={getattr(e, 'status', 'N/A')}")
+        except Exception as e:
+            logger.exception(f"[DTEK_COG] CRITICAL: Unexpected error sending error response: {type(e).__name__}: {e}")
 
     def cog_unload(self):
         logger.info("DTEKMonitor cog unloading, cancelling tasks...")
@@ -175,27 +181,36 @@ class DTEKMonitor(commands.Cog):
         ]
 
     async def _get_power_status(self, address: AddressConfig) -> PowerStatus:
+        logger.debug(f"[GET_STATUS] Getting power status for address: {address.label} (ID: {address.id})")
+
         try:
+            logger.debug(f"[GET_STATUS] Checking cache for region {address.region}...")
             cache = self.scraper_service.get_cache(address.region)
+
             if not cache:
+                logger.info(f"[GET_STATUS] No cache for region {address.region}, fetching...")
                 await self.scraper_service.fetch_schedule_data(address.region)
                 cache = self.scraper_service.get_cache(address.region)
 
             if not cache:
+                logger.error(f"[GET_STATUS] Failed to fetch schedule data for region {address.region}")
                 raise ValueError(f"Failed to fetch schedule data for region {address.region}")
 
+            logger.debug(f"[GET_STATUS] Looking up queue for {address.label}...")
             queue = await self.scraper_service.lookup_queue(
                 address.region,
                 address.city,
                 address.street,
                 address.house,
             )
-            logger.info(f"Resolved queue for {address.label}: {queue}")
+            logger.info(f"[GET_STATUS] Resolved queue for {address.label}: {queue}")
 
+            logger.debug(f"[GET_STATUS] Getting current status from scraper service...")
             current_status, status_label, schedule_blocks, next_change, next_change_status, hourly_schedule = self.scraper_service.get_current_status(
                 cache.fact,
                 queue,
             )
+            logger.info(f"[GET_STATUS] Status for {address.label}: {current_status} ({status_label})")
 
             return PowerStatus(
                 address=address,
@@ -209,7 +224,7 @@ class DTEKMonitor(commands.Cog):
             )
 
         except Exception as e:
-            logger.error(f"Error getting power status for {address.label}: {e}")
+            logger.exception(f"[GET_STATUS] Error getting power status for {address.label}: {type(e).__name__}: {e}")
             return PowerStatus(
                 address=address,
                 current_status="error",
@@ -219,45 +234,81 @@ class DTEKMonitor(commands.Cog):
             )
 
     async def _update_status_message(self, channel_id: int, addresses: List[AddressConfig]):
+        logger.info(f"[UPDATE_MSG] Updating status message for channel {channel_id} with {len(addresses)} addresses")
+
         if not addresses:
+            logger.debug(f"[UPDATE_MSG] No addresses provided, skipping")
             return
 
+        logger.debug(f"[UPDATE_MSG] Checking bot connection state...")
+        logger.debug(f"[UPDATE_MSG] Bot is_ready: {self.bot.is_ready()}, is_closed: {self.bot.is_closed()}, latency: {self.bot.latency * 1000:.2f}ms")
+
+        logger.debug(f"[UPDATE_MSG] Getting channel {channel_id}...")
         channel = self.bot.get_channel(channel_id)
-        if not channel or not isinstance(channel, discord.TextChannel):
-            logger.warning(f"Channel {channel_id} not found or not a text channel")
+
+        if not channel:
+            logger.warning(f"[UPDATE_MSG] Channel {channel_id} not found in bot cache")
             return
 
+        if not isinstance(channel, discord.TextChannel):
+            logger.warning(f"[UPDATE_MSG] Channel {channel_id} is not a TextChannel (type: {type(channel).__name__})")
+            return
+
+        logger.info(f"[UPDATE_MSG] Channel found: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
+
+        logger.debug(f"[UPDATE_MSG] Fetching power statuses for {len(addresses)} addresses...")
         statuses = []
-        for addr in addresses:
+        for i, addr in enumerate(addresses):
+            logger.debug(f"[UPDATE_MSG] Fetching status {i+1}/{len(addresses)} for {addr.label}...")
             status = await self._get_power_status(addr)
             statuses.append(status)
             self._status_cache[addr.id] = status
+            logger.debug(f"[UPDATE_MSG] Status cached for {addr.label}")
 
+        logger.debug(f"[UPDATE_MSG] Building embed...")
         embed = self.embed_builder.build_status_embed(statuses)
+        logger.debug(f"[UPDATE_MSG] Embed built")
 
         message_id = addresses[0].message_id
+        logger.debug(f"[UPDATE_MSG] Existing message_id: {message_id}")
 
         try:
             if message_id:
+                logger.debug(f"[UPDATE_MSG] Attempting to fetch and edit existing message {message_id}...")
                 try:
                     message = await channel.fetch_message(message_id)
+                    logger.debug(f"[UPDATE_MSG] Message {message_id} fetched, editing...")
                     await message.edit(embed=embed)
+                    logger.info(f"[UPDATE_MSG] Successfully edited message {message_id}")
                     return
                 except discord.NotFound:
-                    pass
+                    logger.warning(f"[UPDATE_MSG] Message {message_id} not found, will create new message")
+                except discord.HTTPException as e:
+                    logger.error(f"[UPDATE_MSG] HTTP error fetching/editing message {message_id}: {e}, status={getattr(e, 'status', 'N/A')}")
+                except Exception as e:
+                    logger.exception(f"[UPDATE_MSG] Unexpected error fetching/editing message {message_id}: {e}")
 
+            logger.debug(f"[UPDATE_MSG] Sending new message to channel {channel_id}...")
             message = await channel.send(embed=embed)
+            logger.info(f"[UPDATE_MSG] New message created: {message.id}")
 
-            for addr in addresses:
+            logger.debug(f"[UPDATE_MSG] Updating database with new message_id...")
+            for i, addr in enumerate(addresses):
+                logger.debug(f"[UPDATE_MSG] Updating message_id for address {i+1}/{len(addresses)}: {addr.label}")
                 await self.db.update_dtek_message_id(addr.id, message.id)
                 addr.message_id = message.id
+            logger.info(f"[UPDATE_MSG] Database updated with message_id {message.id}")
 
-        except discord.Forbidden:
-            logger.error(f"No permission to send/edit in channel {channel_id}")
+        except discord.Forbidden as e:
+            logger.error(f"[UPDATE_MSG] CRITICAL: No permission to send/edit in channel {channel_id}: {e}")
+        except discord.HTTPException as e:
+            logger.exception(f"[UPDATE_MSG] CRITICAL: Discord HTTP error updating status message: {e}, status={getattr(e, 'status', 'N/A')}")
         except Exception as e:
-            logger.error(f"Error updating status message: {e}")
+            logger.exception(f"[UPDATE_MSG] CRITICAL: Unexpected error updating status message: {type(e).__name__}: {e}")
+        finally:
+            logger.debug(f"[UPDATE_MSG] _update_status_message exiting for channel {channel_id}")
 
-    async def _label_autocomplete(self, ctx: discord.AutocompleteContext) -> List[str]:
+    async def label_autocomplete(self, ctx: discord.AutocompleteContext) -> List[str]:
         try:
             if not ctx.interaction.guild_id:
                 return []
@@ -270,10 +321,10 @@ class DTEKMonitor(commands.Cog):
             logger.error(f"Error in label autocomplete: {e}")
             return []
 
-    @dtek.command(name="add_address", description="Add an address to monitor")
+    @commands.slash_command(name="dtek_add_address", description="Add an address to monitor for DTEK power shutdowns")
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
-    async def add_address(
+    async def dtek_add_address(
         self,
         ctx: discord.ApplicationContext,
         region: str = discord.Option(
@@ -289,40 +340,59 @@ class DTEKMonitor(commands.Cog):
         city: Optional[str] = discord.Option(description="КРЕМ: City (required) | КЕМ: Not needed", required=False, default=None),
         channel: Optional[discord.TextChannel] = discord.Option(description="Channel to post updates", required=False, default=None),
     ):
-        logger.info(f"add_address command started by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild_id}")
+        logger.info(f"[ADD_ADDRESS] Command invoked by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild_id}, channel {ctx.channel_id}")
+        logger.info(f"[ADD_ADDRESS] Parameters: region={region}, street={street}, house={house}, label={label}, city={city}, channel={channel}")
+
         try:
+            logger.debug(f"[ADD_ADDRESS] Attempting to defer response...")
             await asyncio.wait_for(ctx.defer(ephemeral=True), timeout=5.0)
-            logger.info(f"add_address deferred successfully for {ctx.author}")
+            logger.info(f"[ADD_ADDRESS] Response deferred successfully")
         except asyncio.TimeoutError:
-            logger.error(f"add_address defer() timed out for {ctx.author}")
+            logger.error(f"[ADD_ADDRESS] CRITICAL: defer() timed out after 5 seconds")
+            return
+        except discord.HTTPException as e:
+            logger.exception(f"[ADD_ADDRESS] CRITICAL: Discord HTTP error during defer(): {e}, status={getattr(e, 'status', 'N/A')}, code={getattr(e, 'code', 'N/A')}")
             return
         except Exception as e:
-            logger.exception(f"add_address defer() failed for {ctx.author}: {e}")
+            logger.exception(f"[ADD_ADDRESS] CRITICAL: Unexpected error during defer(): {type(e).__name__}: {e}")
             return
 
         if not ctx.guild:
-            await ctx.respond(":x: Ця команда доступна лише на сервері.", ephemeral=True)
+            logger.warning(f"[ADD_ADDRESS] Command used outside guild context")
+            try:
+                await ctx.respond(":x: Ця команда доступна лише на сервері.", ephemeral=True)
+            except Exception as e:
+                logger.exception(f"[ADD_ADDRESS] Failed to send guild-only error: {e}")
             return
 
+        logger.debug(f"[ADD_ADDRESS] Validating region configuration...")
         region_config = DTEK_REGIONS.get(region, DTEK_REGIONS["krem"])
         if region_config.get("has_city", True) and not city:
-            await ctx.respond(
-                ":x: Для регіону **ДТЕК КРЕМ** потрібно вказати місто (параметр `city`).\n"
-                "Приклад: `с. Велика Солтанівка`",
-                ephemeral=True,
-            )
+            logger.warning(f"[ADD_ADDRESS] Missing city parameter for region {region}")
+            try:
+                await ctx.respond(
+                    ":x: Для регіону **ДТЕК КРЕМ** потрібно вказати місто (параметр `city`).\n"
+                    "Приклад: `с. Велика Солтанівка`",
+                    ephemeral=True,
+                )
+            except Exception as e:
+                logger.exception(f"[ADD_ADDRESS] Failed to send city validation error: {e}")
             return
 
         actual_city = city if city else ""
         target_channel = channel or ctx.channel
+        logger.info(f"[ADD_ADDRESS] Target channel: {target_channel.id} ({target_channel.name})")
 
         try:
-            logger.debug(f"Fetching schedule data for region {region}...")
+            logger.info(f"[ADD_ADDRESS] Starting scraper service fetch for region {region}...")
             await self.scraper_service.fetch_schedule_data(region)
-            logger.debug(f"Looking up queue for {actual_city}, {street}, {house}...")
-            queue = await self.scraper_service.lookup_queue(region, actual_city, street, house)
-            logger.debug(f"Queue lookup result: {queue}")
+            logger.info(f"[ADD_ADDRESS] Schedule data fetched successfully for region {region}")
 
+            logger.info(f"[ADD_ADDRESS] Looking up queue for address: city='{actual_city}', street='{street}', house='{house}'")
+            queue = await self.scraper_service.lookup_queue(region, actual_city, street, house)
+            logger.info(f"[ADD_ADDRESS] Queue resolved successfully: {queue}")
+
+            logger.debug(f"[ADD_ADDRESS] Adding address to database...")
             addr_id = await self.db.add_dtek_address(
                 region=region,
                 city=actual_city,
@@ -332,39 +402,65 @@ class DTEKMonitor(commands.Cog):
                 guild_id=ctx.guild.id,
                 channel_id=target_channel.id,
             )
+            logger.info(f"[ADD_ADDRESS] Address added to database with ID: {addr_id}")
 
             if region_config.get("has_city", True):
                 location_str = f"{actual_city}, {street}, {house}"
             else:
                 location_str = f"{actual_city}, {street}, {house}" if actual_city else f"{street}, {house}"
 
-            await ctx.respond(
-                f":white_check_mark: Адресу **{label}** додано!\n"
-                f":round_pushpin: {location_str}\n"
-                f":tv: Канал: {target_channel.mention}\n"
-                f":electric_plug: Черга відключень: `{queue}`",
-                ephemeral=True,
-            )
+            logger.debug(f"[ADD_ADDRESS] Sending success response...")
+            try:
+                await ctx.respond(
+                    f":white_check_mark: Адресу **{label}** додано!\n"
+                    f":round_pushpin: {location_str}\n"
+                    f":tv: Канал: {target_channel.mention}\n"
+                    f":electric_plug: Черга відключень: `{queue}`",
+                    ephemeral=True,
+                )
+                logger.info(f"[ADD_ADDRESS] Success response sent to user")
+            except discord.HTTPException as e:
+                logger.exception(f"[ADD_ADDRESS] Failed to send success response: {e}, status={getattr(e, 'status', 'N/A')}")
+            except Exception as e:
+                logger.exception(f"[ADD_ADDRESS] Unexpected error sending success response: {e}")
 
+            logger.debug(f"[ADD_ADDRESS] Reloading addresses from database...")
             await self._load_addresses()
             addresses = [a for a in self._addresses if a.channel_id == target_channel.id]
+            logger.info(f"[ADD_ADDRESS] Found {len(addresses)} addresses for channel {target_channel.id}")
+
+            logger.debug(f"[ADD_ADDRESS] Updating status message...")
             await self._update_status_message(target_channel.id, addresses)
-            logger.info(f"add_address command completed successfully for {ctx.author}")
+            logger.info(f"[ADD_ADDRESS] Command completed successfully for {ctx.author}")
 
         except ValidationException as e:
-            logger.warning(f"add_address validation error for {ctx.author}: {e}")
-            await ctx.respond(f":x: Помилка валідації адреси: {e}", ephemeral=True)
+            logger.warning(f"[ADD_ADDRESS] Validation error: {e}")
+            try:
+                await ctx.respond(f":x: Помилка валідації адреси: {e}", ephemeral=True)
+            except Exception as resp_err:
+                logger.exception(f"[ADD_ADDRESS] Failed to send validation error response: {resp_err}")
+        except discord.HTTPException as e:
+            logger.exception(f"[ADD_ADDRESS] Discord HTTP error: {e}, status={getattr(e, 'status', 'N/A')}, code={getattr(e, 'code', 'N/A')}")
+            try:
+                await ctx.respond(f":x: Помилка Discord API: {e}", ephemeral=True)
+            except Exception as resp_err:
+                logger.exception(f"[ADD_ADDRESS] Failed to send HTTP error response: {resp_err}")
         except Exception as e:
-            logger.exception(f"Error adding address: {e}")
-            await ctx.respond(f":x: Помилка: {e}", ephemeral=True)
+            logger.exception(f"[ADD_ADDRESS] CRITICAL: Unexpected error: {type(e).__name__}: {e}")
+            try:
+                await ctx.respond(f":x: Помилка: {e}", ephemeral=True)
+            except Exception as resp_err:
+                logger.exception(f"[ADD_ADDRESS] Failed to send general error response: {resp_err}")
+        finally:
+            logger.info(f"[ADD_ADDRESS] Command handler exiting for {ctx.author}")
 
-    @dtek.command(name="remove_address", description="Remove a monitored address")
+    @commands.slash_command(name="dtek_remove_address", description="Remove a monitored DTEK address")
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
-    async def remove_address(
+    async def dtek_remove_address(
         self,
         ctx: discord.ApplicationContext,
-        label: str = discord.Option(description="Label of the address to remove", autocomplete=_label_autocomplete),
+        label: str = discord.Option(str, description="Label of the address to remove"),
     ):
         await ctx.defer(ephemeral=True)
 
@@ -384,10 +480,10 @@ class DTEKMonitor(commands.Cog):
             logger.exception(f"Error removing address: {e}")
             await ctx.respond(f":x: Помилка: {e}", ephemeral=True)
 
-    @dtek.command(name="list_addresses", description="List monitored addresses")
+    @commands.slash_command(name="dtek_list_addresses", description="List monitored DTEK addresses")
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
-    async def list_addresses(self, ctx: discord.ApplicationContext):
+    async def dtek_list_addresses(self, ctx: discord.ApplicationContext):
         logger.info(f"list_addresses command started by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild_id}")
         try:
             await asyncio.wait_for(ctx.defer(ephemeral=True), timeout=5.0)
@@ -442,23 +538,33 @@ class DTEKMonitor(commands.Cog):
             logger.exception(f"Error listing addresses for {ctx.author}: {e}")
             await ctx.respond(f":x: Помилка: {e}", ephemeral=True)
 
-    @dtek.command(name="refresh", description="Force refresh power status")
+    @commands.slash_command(name="dtek_refresh", description="Force refresh DTEK power status")
     @commands.has_permissions(administrator=True)
-    async def refresh(self, ctx: discord.ApplicationContext):
-        logger.info(f"refresh command started by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild_id}")
+    async def dtek_refresh(self, ctx: discord.ApplicationContext):
+        logger.info(f"[REFRESH] Command invoked by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild_id}")
+
         try:
+            logger.debug(f"[REFRESH] Attempting to defer response...")
             await asyncio.wait_for(ctx.defer(ephemeral=True), timeout=5.0)
-            logger.info(f"refresh deferred successfully for {ctx.author}")
+            logger.info(f"[REFRESH] Response deferred successfully")
         except asyncio.TimeoutError:
-            logger.error(f"refresh defer() timed out for {ctx.author}")
+            logger.error(f"[REFRESH] CRITICAL: defer() timed out")
+            return
+        except discord.HTTPException as e:
+            logger.exception(f"[REFRESH] CRITICAL: Discord HTTP error during defer(): {e}")
             return
         except Exception as e:
-            logger.exception(f"refresh defer() failed for {ctx.author}: {e}")
+            logger.exception(f"[REFRESH] CRITICAL: Unexpected error during defer(): {e}")
             return
 
         try:
+            logger.debug(f"[REFRESH] Clearing scraper cache...")
             self.scraper_service.clear_cache()
+            logger.debug(f"[REFRESH] Cache cleared")
+
+            logger.debug(f"[REFRESH] Loading addresses...")
             await self._load_addresses()
+            logger.info(f"[REFRESH] Loaded {len(self._addresses)} total addresses")
 
             by_channel: Dict[int, List[AddressConfig]] = {}
             for addr in self._addresses:
@@ -468,59 +574,100 @@ class DTEKMonitor(commands.Cog):
                     by_channel[addr.channel_id] = []
                 by_channel[addr.channel_id].append(addr)
 
-            for channel_id, addresses in by_channel.items():
+            logger.info(f"[REFRESH] Found {len(by_channel)} channels with addresses for guild {ctx.guild_id}")
+
+            for i, (channel_id, addresses) in enumerate(by_channel.items()):
+                logger.debug(f"[REFRESH] Updating channel {i+1}/{len(by_channel)}: {channel_id} ({len(addresses)} addresses)")
                 await self._update_status_message(channel_id, addresses)
+                logger.debug(f"[REFRESH] Channel {channel_id} updated")
 
+            logger.debug(f"[REFRESH] Sending success response...")
             await ctx.respond(":white_check_mark: Статус оновлено!", ephemeral=True)
-            logger.info(f"refresh command completed successfully for {ctx.author}")
+            logger.info(f"[REFRESH] Command completed successfully")
 
+        except discord.HTTPException as e:
+            logger.exception(f"[REFRESH] Discord HTTP error: {e}")
+            try:
+                await ctx.respond(f":x: Помилка Discord API: {e}", ephemeral=True)
+            except Exception:
+                pass
         except Exception as e:
-            logger.exception(f"Error refreshing for {ctx.author}: {e}")
-            await ctx.respond(f":x: Помилка: {e}", ephemeral=True)
+            logger.exception(f"[REFRESH] CRITICAL: Unexpected error: {e}")
+            try:
+                await ctx.respond(f":x: Помилка: {e}", ephemeral=True)
+            except Exception:
+                pass
+        finally:
+            logger.info(f"[REFRESH] Command handler exiting")
 
-    @dtek.command(name="status", description="Show current power status for all addresses")
+    @commands.slash_command(name="dtek_status", description="Show current DTEK power status for all addresses")
     @commands.has_permissions(administrator=True)
-    async def status(self, ctx: discord.ApplicationContext):
-        logger.info(f"status command started by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild_id}")
+    async def dtek_status(self, ctx: discord.ApplicationContext):
+        logger.info(f"[STATUS] Command invoked by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild_id}")
+
         try:
+            logger.debug(f"[STATUS] Attempting to defer response...")
             await asyncio.wait_for(ctx.defer(), timeout=5.0)
-            logger.info(f"status deferred successfully for {ctx.author}")
+            logger.info(f"[STATUS] Response deferred successfully")
         except asyncio.TimeoutError:
-            logger.error(f"status defer() timed out for {ctx.author}")
+            logger.error(f"[STATUS] CRITICAL: defer() timed out")
+            return
+        except discord.HTTPException as e:
+            logger.exception(f"[STATUS] CRITICAL: Discord HTTP error during defer(): {e}")
             return
         except Exception as e:
-            logger.exception(f"status defer() failed for {ctx.author}: {e}")
+            logger.exception(f"[STATUS] CRITICAL: Unexpected error during defer(): {e}")
             return
 
         try:
+            logger.debug(f"[STATUS] Loading addresses from database...")
             await self._load_addresses()
             guild_addresses = [a for a in self._addresses if a.guild_id == ctx.guild.id]
+            logger.info(f"[STATUS] Found {len(guild_addresses)} addresses for guild {ctx.guild_id}")
 
             if not guild_addresses:
-                await ctx.respond(":mailbox_with_no_mail: Немає моніторингових адрес. Додайте через `/dtek add_address`")
+                logger.info(f"[STATUS] No addresses found, sending empty response")
+                await ctx.respond(":mailbox_with_no_mail: Немає моніторингових адрес. Додайте через `/dtek_add_address`")
                 return
 
+            logger.debug(f"[STATUS] Getting power status for {len(guild_addresses)} addresses...")
             statuses = []
-            for addr in guild_addresses:
+            for i, addr in enumerate(guild_addresses):
+                logger.debug(f"[STATUS] Getting status for address {i+1}/{len(guild_addresses)}: {addr.label}")
                 status = await self._get_power_status(addr)
                 statuses.append(status)
+                logger.debug(f"[STATUS] Status retrieved for {addr.label}: {status.current_status}")
 
+            logger.debug(f"[STATUS] Building embed...")
             embed = self.embed_builder.build_status_embed(statuses)
+
+            logger.debug(f"[STATUS] Sending response...")
             await ctx.respond(embed=embed)
-            logger.info(f"status command completed successfully for {ctx.author}")
+            logger.info(f"[STATUS] Command completed successfully")
 
+        except discord.HTTPException as e:
+            logger.exception(f"[STATUS] Discord HTTP error: {e}")
+            try:
+                await ctx.respond(f":x: Помилка Discord API: {e}")
+            except Exception:
+                pass
         except Exception as e:
-            logger.exception(f"Error getting status for {ctx.author}: {e}")
-            await ctx.respond(f":x: Помилка: {e}")
+            logger.exception(f"[STATUS] CRITICAL: Unexpected error: {e}")
+            try:
+                await ctx.respond(f":x: Помилка: {e}")
+            except Exception:
+                pass
+        finally:
+            logger.info(f"[STATUS] Command handler exiting")
 
-    @dtek.command(name="set_channel", description="Change the channel where status updates are displayed")
+    @commands.slash_command(name="dtek_set_channel", description="Change the channel where DTEK status updates are displayed")
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
-    async def set_channel(
+    async def dtek_set_channel(
         self,
         ctx: discord.ApplicationContext,
-        label: str = discord.Option(description="Label of the address to update", autocomplete=_label_autocomplete),
-        channel: discord.TextChannel = discord.Option(description="New channel for status updates"),
+        label: str = discord.Option(str, description="Label of the address to update"),
+        channel: discord.TextChannel = discord.Option(discord.TextChannel, description="New channel for status updates"),
     ):
         await ctx.defer(ephemeral=True)
 
@@ -566,9 +713,9 @@ class DTEKMonitor(commands.Cog):
             logger.exception(f"Error changing channel: {e}")
             await ctx.respond(f":x: Помилка: {e}", ephemeral=True)
 
-    @dtek.command(name="task_status", description="Check the status of the automatic update task")
+    @commands.slash_command(name="dtek_task_status", description="Check the status of the DTEK automatic update task")
     @commands.has_permissions(administrator=True)
-    async def task_status(self, ctx: discord.ApplicationContext):
+    async def dtek_task_status(self, ctx: discord.ApplicationContext):
         logger.info(f"task_status command invoked by {ctx.author} in guild {ctx.guild_id}")
         await ctx.defer(ephemeral=True)
 
@@ -596,9 +743,9 @@ class DTEKMonitor(commands.Cog):
 
         await ctx.respond("\n".join(status_lines), ephemeral=True)
 
-    @dtek.command(name="restart_task", description="Restart the automatic update task if it stopped")
+    @commands.slash_command(name="dtek_restart_task", description="Restart the DTEK automatic update task if it stopped")
     @commands.has_permissions(administrator=True)
-    async def restart_task(self, ctx: discord.ApplicationContext):
+    async def dtek_restart_task(self, ctx: discord.ApplicationContext):
         logger.info(f"restart_task command invoked by {ctx.author} in guild {ctx.guild_id}")
         await ctx.defer(ephemeral=True)
 
@@ -627,4 +774,4 @@ def setup(bot: commands.Bot):
     logger.info("Setting up DTEKMonitor cog...")
     cog = DTEKMonitor(bot)
     bot.add_cog(cog)
-    logger.info(f"DTEKMonitor cog added. Slash command group 'dtek' registered with commands: {[cmd.name for cmd in cog.dtek.walk_commands()]}")
+    logger.info(f"DTEKMonitor cog added with DTEK commands")
