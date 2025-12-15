@@ -243,7 +243,6 @@ class ScraperService:
         async with self._scraper_lock:
             logger.debug(f"[SCRAPER] Lock acquired for region {region}")
 
-            # Double-check cache after acquiring lock
             if region in self._cache:
                 logger.info(f"[SCRAPER] Cache populated while waiting for lock, returning cached data")
                 return self._cache[region]
@@ -427,10 +426,10 @@ class ScraperService:
             logger.exception(f"[SCRAPER] CRITICAL: Failed to pick queue for house '{house}': {e}")
             raise
 
-    def get_current_status(
-        self, fact: dict, queue: str
+    def get_status_for_date(
+        self, fact: dict, queue: str, target_date: datetime
     ) -> Tuple[str, str, List[Tuple[str, str, str]], Optional[str], Optional[str], Dict[int, str]]:
-        logger.debug(f"get_current_status called with queue={queue}")
+        logger.debug(f"get_status_for_date called with queue={queue}, target_date={target_date.date()}")
         logger.debug(f"fact keys: {list(fact.keys())}")
 
         fact_data = fact.get("data", {})
@@ -438,32 +437,32 @@ class ScraperService:
         now = datetime.now(kyiv_tz)
 
         logger.debug(f"fact_data timestamps: {list(fact_data.keys())}")
-        logger.debug(f"Current datetime (Kyiv): {now}, looking for date: {now.date()}")
+        logger.debug(f"Looking for date: {target_date.date()}")
 
-        today_data = None
+        day_data = None
 
-        for ts, day_data in fact_data.items():
+        for ts, data in fact_data.items():
             try:
                 ts_int = int(ts)
                 dt = datetime.fromtimestamp(ts_int, tz=kyiv_tz)
                 logger.debug(f"Checking timestamp {ts} -> date {dt.date()} (Kyiv)")
-                if dt.date() == now.date():
-                    today_data = day_data
-                    logger.debug(f"Found today's data! Queues available: {list(day_data.keys())}")
+                if dt.date() == target_date.date():
+                    day_data = data
+                    logger.debug(f"Found target date data! Queues available: {list(data.keys())}")
                     break
             except (ValueError, OSError) as e:
                 logger.debug(f"Failed to parse timestamp {ts}: {e}")
                 continue
 
-        if not today_data:
-            logger.warning(f"No data found for today ({now.date()})")
+        if not day_data:
+            logger.warning(f"No data found for target date ({target_date.date()})")
             return "unknown", "Невідомо", [], None, None, {}
 
-        if queue not in today_data:
-            logger.warning(f"Queue {queue} not found in today's data. Available queues: {list(today_data.keys())}")
+        if queue not in day_data:
+            logger.warning(f"Queue {queue} not found in day's data. Available queues: {list(day_data.keys())}")
             return "unknown", "Невідомо", [], None, None, {}
 
-        periods = today_data[queue]
+        periods = day_data[queue]
         logger.debug(f"Raw periods for queue {queue}: {periods}")
 
         hourly_schedule = {}
@@ -479,13 +478,17 @@ class ScraperService:
         schedule_blocks = _compress_day_detailed(periods)
         logger.debug(f"Compressed schedule blocks: {schedule_blocks}")
 
-        current_time_str = f"{now.hour:02d}:{now.minute:02d}"
+        check_time = now if target_date.date() == now.date() else target_date.replace(hour=0, minute=0)
+        current_time_str = f"{check_time.hour:02d}:{check_time.minute:02d}"
         current_status = "unknown"
 
         for start, end, status in schedule_blocks:
             if start <= current_time_str < end:
                 current_status = status
                 break
+
+        if target_date.date() != now.date() and schedule_blocks:
+            current_status = schedule_blocks[0][2]
 
         next_change_time = None
         next_change_status = None
@@ -505,3 +508,18 @@ class ScraperService:
                         break
 
         return current_status, STATUS_LABELS.get(current_status, "Невідомо"), schedule_blocks, next_change_time, next_change_status, hourly_schedule
+
+    def get_current_status(
+        self, fact: dict, queue: str
+    ) -> Tuple[str, str, List[Tuple[str, str, str]], Optional[str], Optional[str], Dict[int, str]]:
+        kyiv_tz = ZoneInfo("Europe/Kyiv")
+        now = datetime.now(kyiv_tz)
+        return self.get_status_for_date(fact, queue, now)
+
+    def get_tomorrow_status(
+        self, fact: dict, queue: str
+    ) -> Tuple[str, str, List[Tuple[str, str, str]], Optional[str], Optional[str], Dict[int, str]]:
+        from datetime import timedelta
+        kyiv_tz = ZoneInfo("Europe/Kyiv")
+        tomorrow = datetime.now(kyiv_tz) + timedelta(days=1)
+        return self.get_status_for_date(fact, queue, tomorrow)

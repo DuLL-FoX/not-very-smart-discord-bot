@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from zoneinfo import ZoneInfo
 
@@ -49,7 +49,7 @@ class EmbedBuilder:
         return f"Очікується: **{action}** о `{status.next_change}`"
 
     @classmethod
-    def build_status_embed(cls, statuses: List[PowerStatus]) -> discord.Embed:
+    def build_status_embed(cls, statuses: List[PowerStatus], target_date: Optional[datetime] = None) -> discord.Embed:
         overall_status = "yes"
         for status in statuses:
             if status.current_status == "error":
@@ -67,13 +67,26 @@ class EmbedBuilder:
             "error": discord.Color.from_rgb(116, 127, 141),
         }
 
+        if target_date:
+            weekday_names = ["Понеділок", "Вівторок", "Середа", "Четвер", "П'ятниця", "Субота", "Неділя"]
+            weekday = weekday_names[target_date.weekday()]
+            date_str = target_date.strftime("%d.%m")
+            title = f"Прогноз на завтра ({weekday}, {date_str})"
+        else:
+            title = "Моніторинг електропостачання"
+
         embed = discord.Embed(
-            title="Моніторинг електропостачання",
+            title=title,
             color=color_map.get(overall_status, discord.Color.blue()),
             timestamp=datetime.now(timezone.utc),
         )
 
-        now = datetime.now(cls.KYIV_TZ)
+        if target_date:
+            now = target_date.replace(hour=0, minute=0)
+            is_tomorrow = True
+        else:
+            now = datetime.now(cls.KYIV_TZ)
+            is_tomorrow = False
 
         for idx, status in enumerate(statuses):
             region_config = DTEK_REGIONS.get(status.address.region, DTEK_REGIONS["krem"])
@@ -134,9 +147,15 @@ class EmbedBuilder:
             inline=False,
         )
 
-        embed.set_footer(
-            text="Автооновлення кожні 15 хв",
-            icon_url="https://www.dtek-krem.com.ua/favicon.ico"
-        )
+        if is_tomorrow:
+            embed.set_footer(
+                text="Прогноз може змінитися • Повернення до сьогодні через 15 хв",
+                icon_url="https://www.dtek-krem.com.ua/favicon.ico"
+            )
+        else:
+            embed.set_footer(
+                text="Автооновлення кожні 15 хв",
+                icon_url="https://www.dtek-krem.com.ua/favicon.ico"
+            )
 
         return embed

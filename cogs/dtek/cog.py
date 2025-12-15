@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands, tasks
+from discord.ui import Select, View
 
 from utils.database import Database
 
@@ -28,6 +30,8 @@ class DTEKMonitor(commands.Cog):
         self._addresses: List[AddressConfig] = []
         self._status_cache: Dict[int, PowerStatus] = {}
         self._last_successful_iteration: Optional[datetime] = None
+        self._revert_tasks: Dict[int, asyncio.Task] = {}
+        self._showing_tomorrow: Dict[int, bool] = {}
         logger.info("Starting update_task loop...")
         self.update_task.start()
         self.health_check_task.start()
@@ -119,7 +123,8 @@ class DTEKMonitor(commands.Cog):
                 by_channel[addr.channel_id].append(addr)
 
             for channel_id, addresses in by_channel.items():
-                await self._update_status_message(channel_id, addresses)
+                show_tomorrow = self._showing_tomorrow.get(channel_id, False)
+                await self._update_status_message(channel_id, addresses, show_tomorrow=show_tomorrow)
                 await asyncio.sleep(2)
 
             self._last_successful_iteration = datetime.now(timezone.utc)
@@ -233,8 +238,48 @@ class DTEKMonitor(commands.Cog):
                 last_update=datetime.now(timezone.utc),
             )
 
-    async def _update_status_message(self, channel_id: int, addresses: List[AddressConfig]):
-        logger.info(f"[UPDATE_MSG] Updating status message for channel {channel_id} with {len(addresses)} addresses")
+    async def _get_power_status_for_date(self, address: AddressConfig, target_date: datetime) -> PowerStatus:
+        """Get power status for a specific date (today or tomorrow)."""
+        logger.debug(f"[GET_STATUS_DATE] Getting power status for {address.label} on {target_date.date()}")
+
+        try:
+            cache = self.scraper_service.get_cache(address.region)
+            if not cache:
+                await self.scraper_service.fetch_schedule_data(address.region)
+                cache = self.scraper_service.get_cache(address.region)
+
+            if not cache:
+                raise ValueError(f"Failed to fetch schedule data for region {address.region}")
+
+            queue = await self.scraper_service.lookup_queue(
+                address.region, address.city, address.street, address.house
+            )
+
+            current_status, status_label, schedule_blocks, next_change, next_change_status, hourly_schedule = \
+                self.scraper_service.get_status_for_date(cache.fact, queue, target_date)
+
+            return PowerStatus(
+                address=address,
+                current_status=current_status,
+                current_status_label=status_label,
+                schedule_blocks=schedule_blocks,
+                next_change=next_change,
+                next_change_status=next_change_status,
+                hourly_schedule=hourly_schedule,
+                last_update=datetime.now(timezone.utc),
+            )
+        except Exception as e:
+            logger.exception(f"[GET_STATUS_DATE] Error: {e}")
+            return PowerStatus(
+                address=address,
+                current_status="error",
+                current_status_label="Помилка",
+                error=str(e),
+                last_update=datetime.now(timezone.utc),
+            )
+
+    async def _update_status_message(self, channel_id: int, addresses: List[AddressConfig], show_tomorrow: bool = False):
+        logger.info(f"[UPDATE_MSG] Updating status message for channel {channel_id} with {len(addresses)} addresses (tomorrow={show_tomorrow})")
 
         if not addresses:
             logger.debug(f"[UPDATE_MSG] No addresses provided, skipping")
@@ -256,18 +301,27 @@ class DTEKMonitor(commands.Cog):
 
         logger.info(f"[UPDATE_MSG] Channel found: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
 
+        kyiv_tz = ZoneInfo("Europe/Kyiv")
+        if show_tomorrow:
+            target_date = datetime.now(kyiv_tz) + timedelta(days=1)
+        else:
+            target_date = datetime.now(kyiv_tz)
+
         logger.debug(f"[UPDATE_MSG] Fetching power statuses for {len(addresses)} addresses...")
         statuses = []
         for i, addr in enumerate(addresses):
             logger.debug(f"[UPDATE_MSG] Fetching status {i+1}/{len(addresses)} for {addr.label}...")
-            status = await self._get_power_status(addr)
+            status = await self._get_power_status_for_date(addr, target_date)
             statuses.append(status)
-            self._status_cache[addr.id] = status
-            logger.debug(f"[UPDATE_MSG] Status cached for {addr.label}")
+            if not show_tomorrow:
+                self._status_cache[addr.id] = status
+            logger.debug(f"[UPDATE_MSG] Status fetched for {addr.label}")
 
         logger.debug(f"[UPDATE_MSG] Building embed...")
-        embed = self.embed_builder.build_status_embed(statuses)
+        embed = self.embed_builder.build_status_embed(statuses, target_date if show_tomorrow else None)
         logger.debug(f"[UPDATE_MSG] Embed built")
+
+        view = DateSelectView(self, channel_id, show_tomorrow)
 
         message_id = addresses[0].message_id
         logger.debug(f"[UPDATE_MSG] Existing message_id: {message_id}")
@@ -278,7 +332,7 @@ class DTEKMonitor(commands.Cog):
                 try:
                     message = await channel.fetch_message(message_id)
                     logger.debug(f"[UPDATE_MSG] Message {message_id} fetched, editing...")
-                    await message.edit(embed=embed)
+                    await message.edit(embed=embed, view=view)
                     logger.info(f"[UPDATE_MSG] Successfully edited message {message_id}")
                     return
                 except discord.NotFound:
@@ -289,7 +343,7 @@ class DTEKMonitor(commands.Cog):
                     logger.exception(f"[UPDATE_MSG] Unexpected error fetching/editing message {message_id}: {e}")
 
             logger.debug(f"[UPDATE_MSG] Sending new message to channel {channel_id}...")
-            message = await channel.send(embed=embed)
+            message = await channel.send(embed=embed, view=view)
             logger.info(f"[UPDATE_MSG] New message created: {message.id}")
 
             logger.debug(f"[UPDATE_MSG] Updating database with new message_id...")
@@ -307,6 +361,30 @@ class DTEKMonitor(commands.Cog):
             logger.exception(f"[UPDATE_MSG] CRITICAL: Unexpected error updating status message: {type(e).__name__}: {e}")
         finally:
             logger.debug(f"[UPDATE_MSG] _update_status_message exiting for channel {channel_id}")
+
+    async def _schedule_revert_to_today(self, channel_id: int):
+        """Schedule a task to revert the message back to today after 15 minutes."""
+        if channel_id in self._revert_tasks:
+            self._revert_tasks[channel_id].cancel()
+            del self._revert_tasks[channel_id]
+
+        async def revert_task():
+            try:
+                await asyncio.sleep(15 * 60)
+                logger.info(f"[REVERT] Reverting channel {channel_id} back to today")
+                self._showing_tomorrow[channel_id] = False
+                addresses = [a for a in self._addresses if a.channel_id == channel_id]
+                if addresses:
+                    await self._update_status_message(channel_id, addresses, show_tomorrow=False)
+            except asyncio.CancelledError:
+                logger.debug(f"[REVERT] Revert task for channel {channel_id} was cancelled")
+            except Exception as e:
+                logger.exception(f"[REVERT] Error reverting channel {channel_id}: {e}")
+            finally:
+                if channel_id in self._revert_tasks:
+                    del self._revert_tasks[channel_id]
+
+        self._revert_tasks[channel_id] = asyncio.create_task(revert_task())
 
     async def label_autocomplete(self, ctx: discord.AutocompleteContext) -> List[str]:
         try:
@@ -327,18 +405,18 @@ class DTEKMonitor(commands.Cog):
     async def dtek_add_address(
         self,
         ctx: discord.ApplicationContext,
-        region: str = discord.Option(
+        region: str = discord.Option(  # type: ignore[assignment]
             description="DTEK region",
             choices=[
                 discord.OptionChoice(name="ДТЕК КРЕМ (Київська область)", value="krem"),
                 discord.OptionChoice(name="ДТЕК КЕМ (м. Київ)", value="kem"),
             ],
         ),
-        street: str = discord.Option(description="Street in Ukrainian (e.g. 'вул. Васильківська')"),
-        house: str = discord.Option(description="House number (e.g. '9Г')"),
-        label: str = discord.Option(description="Friendly name for display"),
-        city: Optional[str] = discord.Option(description="КРЕМ: City (required) | КЕМ: Not needed", required=False, default=None),
-        channel: Optional[discord.TextChannel] = discord.Option(description="Channel to post updates", required=False, default=None),
+        street: str = discord.Option(description="Street in Ukrainian (e.g. 'вул. Васильківська')"),  # type: ignore[assignment]
+        house: str = discord.Option(description="House number (e.g. '9Г')"),  # type: ignore[assignment]
+        label: str = discord.Option(description="Friendly name for display"),  # type: ignore[assignment]
+        city: Optional[str] = discord.Option(description="КРЕМ: City (required) | КЕМ: Not needed", required=False, default=None),  # type: ignore[assignment]
+        channel: Optional[discord.TextChannel] = discord.Option(description="Channel to post updates", required=False, default=None),  # type: ignore[assignment]
     ):
         logger.info(f"[ADD_ADDRESS] Command invoked by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild_id}, channel {ctx.channel_id}")
         logger.info(f"[ADD_ADDRESS] Parameters: region={region}, street={street}, house={house}, label={label}, city={city}, channel={channel}")
@@ -460,7 +538,7 @@ class DTEKMonitor(commands.Cog):
     async def dtek_remove_address(
         self,
         ctx: discord.ApplicationContext,
-        label: str = discord.Option(str, description="Label of the address to remove"),
+        label: str = discord.Option(str, description="Label of the address to remove"),  # type: ignore[assignment]
     ):
         await ctx.defer(ephemeral=True)
 
@@ -666,8 +744,8 @@ class DTEKMonitor(commands.Cog):
     async def dtek_set_channel(
         self,
         ctx: discord.ApplicationContext,
-        label: str = discord.Option(str, description="Label of the address to update"),
-        channel: discord.TextChannel = discord.Option(discord.TextChannel, description="New channel for status updates"),
+        label: str = discord.Option(str, description="Label of the address to update"),  # type: ignore[assignment]
+        channel: discord.TextChannel = discord.Option(discord.TextChannel, description="New channel for status updates"),  # type: ignore[assignment]
     ):
         await ctx.defer(ephemeral=True)
 
@@ -768,6 +846,89 @@ class DTEKMonitor(commands.Cog):
         except Exception as e:
             logger.exception(f"Error restarting task: {e}")
             await ctx.respond(f":x: Помилка перезапуску: {e}", ephemeral=True)
+
+class DateSelectView(View):
+    """Persistent view with date selector dropdown."""
+
+    def __init__(self, cog: DTEKMonitor, channel_id: int, showing_tomorrow: bool = False):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.channel_id = channel_id
+
+        select = DateSelect(cog, channel_id, showing_tomorrow)
+        self.add_item(select)
+
+
+class DateSelect(Select):
+    """Select menu for choosing today or tomorrow."""
+
+    def __init__(self, cog: DTEKMonitor, channel_id: int, showing_tomorrow: bool = False):
+        self.cog = cog
+        self.channel_id = channel_id
+
+        kyiv_tz = ZoneInfo("Europe/Kyiv")
+        today = datetime.now(kyiv_tz)
+        tomorrow = today + timedelta(days=1)
+
+        weekday_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]
+
+        options = [
+            discord.SelectOption(
+                label="Сьогодні",
+                value="today",
+                description=f"{weekday_names[today.weekday()]}, {today.strftime('%d.%m')}",
+                emoji="📅",
+                default=not showing_tomorrow,
+            ),
+            discord.SelectOption(
+                label="Завтра",
+                value="tomorrow",
+                description=f"{weekday_names[tomorrow.weekday()]}, {tomorrow.strftime('%d.%m')}",
+                emoji="🔮",
+                default=showing_tomorrow,
+            ),
+        ]
+
+        super().__init__(
+            placeholder="Оберіть дату...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"dtek_date_select_{channel_id}",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values[0]
+        show_tomorrow = selected == "tomorrow"
+
+        logger.info(f"[DATE_SELECT] User {interaction.user} selected '{selected}' for channel {self.channel_id}")
+
+        await interaction.response.defer()
+
+        try:
+            await self.cog._load_addresses()
+            addresses = [a for a in self.cog._addresses if a.channel_id == self.channel_id]
+
+            if not addresses:
+                await interaction.followup.send(":x: Адреси не знайдено", ephemeral=True)
+                return
+
+            self.cog._showing_tomorrow[self.channel_id] = show_tomorrow
+
+            await self.cog._update_status_message(self.channel_id, addresses, show_tomorrow=show_tomorrow)
+
+            if show_tomorrow:
+                await self.cog._schedule_revert_to_today(self.channel_id)
+            else:
+                if self.channel_id in self.cog._revert_tasks:
+                    self.cog._revert_tasks[self.channel_id].cancel()
+                    del self.cog._revert_tasks[self.channel_id]
+
+            logger.info(f"[DATE_SELECT] Updated message for channel {self.channel_id}, tomorrow={show_tomorrow}")
+
+        except Exception as e:
+            logger.exception(f"[DATE_SELECT] Error: {e}")
+            await interaction.followup.send(f":x: Помилка: {e}", ephemeral=True)
 
 
 def setup(bot: commands.Bot):
